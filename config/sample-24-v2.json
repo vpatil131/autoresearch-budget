@@ -1,0 +1,180 @@
+{
+  "name": "swe-rebench-historical-task-identities",
+  "description": "Historical task identities; experiment measurements are archived separately.",
+  "source": {
+    "harbor_dataset": "ibragim-badertdinov/swe-rebench-07-2026",
+    "version": "1.0.0",
+    "revision": 1
+  },
+  "task_count": 24,
+  "tasks": [
+    {
+      "task_id": "gotd__td-1759",
+      "repo": "gotd/td",
+      "language": "go",
+      "base_commit": "667a066e54da308f74fb1e4ad93f9577767ed983",
+      "image": "docker.io/swerebenchv2/gotd__td-1759:v0.1.0"
+    },
+    {
+      "task_id": "HKUDS__nanobot-4048",
+      "repo": "HKUDS/nanobot",
+      "language": "python",
+      "base_commit": "3a420136bbce81f80065b3edfc2dcc8f5ef0fdcb",
+      "image": "docker.io/swerebenchv2/hkuds__nanobot-4048:v0.1.0"
+    },
+    {
+      "task_id": "HKUDS__nanobot-4129",
+      "repo": "HKUDS/nanobot",
+      "language": "python",
+      "base_commit": "9ecd25bca1e6a6abf0f621640d36b1e722965a71",
+      "image": "docker.io/swerebenchv2/hkuds__nanobot-4129:v0.1.0"
+    },
+    {
+      "task_id": "marimo-team__marimo-9626",
+      "repo": "marimo-team/marimo",
+      "language": "python",
+      "base_commit": "edbb52649480b2a441d322301415907ea792e207",
+      "image": "docker.io/swerebenchv2/marimo-team__marimo-9626:v0.1.0"
+    },
+    {
+      "task_id": "marimo-team__marimo-9754",
+      "repo": "marimo-team/marimo",
+      "language": "python",
+      "base_commit": "2a9bf11728924dc3d13b866108f4d587bf32b40b",
+      "image": "docker.io/swerebenchv2/marimo-team__marimo-9754:v0.1.0"
+    },
+    {
+      "task_id": "marimo-team__marimo-9766",
+      "repo": "marimo-team/marimo",
+      "language": "python",
+      "base_commit": "4d47f09aea6588159979b60893dc2e7fe2a1a457",
+      "image": "docker.io/swerebenchv2/marimo-team__marimo-9766:v0.1.0"
+    },
+    {
+      "task_id": "cloudflare__vinext-1574",
+      "repo": "cloudflare/vinext",
+      "language": "typescript",
+      "base_commit": "97c11cdc374d380b27ea172f8a1410ab6f87c261",
+      "image": "docker.io/swerebenchv2/cloudflare__vinext-1574:v0.1.0"
+    },
+    {
+      "task_id": "open-jarvis__OpenJarvis-465",
+      "repo": "open-jarvis/OpenJarvis",
+      "language": "python",
+      "base_commit": "5270149ea59f5c9eb4be23e4ab3e037a7cab8b31",
+      "image": "docker.io/swerebenchv2/open-jarvis__openjarvis-465:v0.1.0"
+    },
+    {
+      "task_id": "vuejs__core-14897",
+      "repo": "vuejs/core",
+      "language": "typescript",
+      "base_commit": "86ad0764fd9f7b01cef75b4fc941b03419306bf8",
+      "image": "docker.io/swerebenchv2/vuejs__core-14897:v0.1.0"
+    },
+    {
+      "task_id": "vuejs__core-14877",
+      "repo": "vuejs/core",
+      "language": "typescript",
+      "base_commit": "bbdf86dcc6e3a8108c6313484ddfb52019b3e0e8",
+      "image": "docker.io/swerebenchv2/vuejs__core-14877:v0.1.0"
+    },
+    {
+      "task_id": "tailscale__tailscale-19847",
+      "repo": "tailscale/tailscale",
+      "language": "go",
+      "base_commit": "5295e3e1195e77821feb11537ba40bb0a49124ae",
+      "image": "docker.io/swerebenchv2/tailscale__tailscale-19847:v0.1.0"
+    },
+    {
+      "task_id": "docker__docker-agent-2992",
+      "repo": "docker/docker-agent",
+      "language": "go",
+      "base_commit": "2b369cebe7b8d3bc80f135a4498995d9d57da61a",
+      "image": "docker.io/swerebenchv2/docker__docker-agent-2992:v0.1.0"
+    },
+    {
+      "task_id": "floci-io__floci-1235",
+      "repo": "floci-io/floci",
+      "language": "java",
+      "base_commit": "94a8bdaca1b58da108107c8b08c78538052e2736",
+      "image": "docker.io/swerebenchv2/floci-io__floci-1235:v0.1.0"
+    },
+    {
+      "task_id": "apache__hugegraph-3037",
+      "repo": "apache/hugegraph",
+      "language": "java",
+      "base_commit": "1f61c4839aaee09063f4a6ee17d831dc542fbe9d",
+      "image": "docker.io/swerebenchv2/apache__hugegraph-3037:v0.1.0"
+    },
+    {
+      "task_id": "verl-project__verl-6506",
+      "repo": "verl-project/verl",
+      "language": "python",
+      "base_commit": "75be454b7d8511823ff3730e3fe4138cbd3e4764",
+      "image": "docker.io/swerebenchv2/verl-project__verl-6506:v0.1.0"
+    },
+    {
+      "task_id": "mozilla-ai__any-llm-1121",
+      "repo": "mozilla-ai/any-llm",
+      "language": "python",
+      "base_commit": "3f9aaaa023c130b2d2a3ae491d5ef6f866fc3850",
+      "image": "docker.io/swerebenchv2/mozilla-ai__any-llm-1121:v0.1.0"
+    },
+    {
+      "task_id": "ivov__lisette-491",
+      "repo": "ivov/lisette",
+      "language": "rust",
+      "base_commit": "04a8a2bdcf72775d24317428a947b17ff1c34f04",
+      "image": "docker.io/swerebenchv2/ivov__lisette-491:v0.1.0"
+    },
+    {
+      "task_id": "withcoral__coral-1186",
+      "repo": "withcoral/coral",
+      "language": "rust",
+      "base_commit": "fe925f9f996fc32a423857e2ac9ac41750569dbc",
+      "image": "docker.io/swerebenchv2/withcoral__coral-1186:v0.1.0"
+    },
+    {
+      "task_id": "danny-avila__LibreChat-13166",
+      "repo": "danny-avila/LibreChat",
+      "language": "typescript",
+      "base_commit": "89d10a0b837b603d9a4862762cb5e91fa2724966",
+      "image": "docker.io/swerebenchv2/danny-avila__librechat-13166:v0.1.0"
+    },
+    {
+      "task_id": "facebook__lexical-8676",
+      "repo": "facebook/lexical",
+      "language": "typescript",
+      "base_commit": "e40f2836d2c960b68ee34ede12a16915c2a16cf0",
+      "image": "docker.io/swerebenchv2/facebook__lexical-8676:v0.1.0"
+    },
+    {
+      "task_id": "apache__pulsar-25953",
+      "repo": "apache/pulsar",
+      "language": "java",
+      "base_commit": "141438756c1bae463c26c4f2f7ee77eb6353c315",
+      "image": "docker.io/swerebenchv2/apache__pulsar-25953:v0.1.0"
+    },
+    {
+      "task_id": "openrewrite__rewrite-7784",
+      "repo": "openrewrite/rewrite",
+      "language": "java",
+      "base_commit": "2d625133cc0797cf91dca8dca5dfd70400bf5cfe",
+      "image": "docker.io/swerebenchv2/openrewrite__rewrite-7784:v0.1.0"
+    },
+    {
+      "task_id": "kubernetes-sigs__kueue-11559",
+      "repo": "kubernetes-sigs/kueue",
+      "language": "go",
+      "base_commit": "8078525295edb6717ccbfa9343c06834eb675a3b",
+      "image": "docker.io/swerebenchv2/kubernetes-sigs__kueue-11559:v0.1.0"
+    },
+    {
+      "task_id": "microsoft__typescript-go-4194",
+      "repo": "microsoft/typescript-go",
+      "language": "go",
+      "base_commit": "dbd8d7f28c4ab9783d10f5ff3e09f9084ad48086",
+      "image": "docker.io/swerebenchv2/microsoft__typescript-go-4194:v0.1.0"
+    }
+  ]
+}
