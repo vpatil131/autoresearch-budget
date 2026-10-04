@@ -71,7 +71,10 @@ class HarborTrialRunnerTest(unittest.TestCase):
                     self._config(root, scaffold="mini-swe-agent")
                 ).command(TrialSpec("owner__repo-1", "small"))
             rendered = " ".join(command)
-            self.assertIn("--agent mini-swe-agent", rendered)
+            self.assertIn(
+                "--agent autoresearch_budget.harbor_mini_agent:BudgetMiniSweAgent",
+                rendered,
+            )
             self.assertIn("--model openrouter/qwen/example", rendered)
             self.assertIn("version=2.4.6", rendered)
             self.assertIn("cost_limit=0.25", rendered)
@@ -173,6 +176,20 @@ class HarborTrialRunnerTest(unittest.TestCase):
             path = Path(temp) / "result.json"
             path.write_text(
                 json.dumps({"n_total_trials": 1, "stats": {"cost_usd": 0.1}})
+            )
+            self.assertIsNone(_completed_job_cost(path))
+
+    def test_completed_job_cost_rejects_null_cost(self):
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "finished_at": "2026-10-03T00:00:00Z",
+                        "n_total_trials": 1,
+                        "stats": {"cost_usd": None},
+                    }
+                )
             )
             self.assertIsNone(_completed_job_cost(path))
 

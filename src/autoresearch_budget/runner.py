@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +84,9 @@ class TrialSpec:
 class HarborTrialRunner:
     AGENT_IMPORT = "autoresearch_budget.harbor_agent:BudgetShellAgent"
     MINI_SWE_AGENT = "mini-swe-agent"
+    MINI_SWE_AGENT_IMPORT = (
+        "autoresearch_budget.harbor_mini_agent:BudgetMiniSweAgent"
+    )
     SUPPORTED_SCAFFOLDS = {"budget-shell", MINI_SWE_AGENT}
 
     def __init__(self, config: ExperimentConfig):
@@ -109,7 +112,7 @@ class HarborTrialRunner:
             str(task_dir),
             "--agent",
             (
-                self.MINI_SWE_AGENT
+                self.MINI_SWE_AGENT_IMPORT
                 if scaffold == self.MINI_SWE_AGENT
                 else self.AGENT_IMPORT
             ),
@@ -403,5 +406,12 @@ def _completed_job_cost(path: Path) -> Decimal | None:
         if not cost.is_finite() or cost < 0:
             return None
         return cost
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        InvalidOperation,
+        json.JSONDecodeError,
+    ):
         return None
