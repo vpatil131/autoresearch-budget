@@ -1,7 +1,7 @@
 {
   "budget": {
     "ledger": "runs/budget.sqlite3",
-    "cap_usd": "10.00"
+    "cap_usd": "15.00"
   },
   "locations": {
     "task_root": "data/harbor/swe-rebench-07-2026",
