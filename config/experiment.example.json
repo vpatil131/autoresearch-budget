@@ -17,10 +17,10 @@
   },
   "profiles": {
     "small": {
-      "model": "qwen/qwen3.6-35b-a3b",
+      "model": "deepseek/deepseek-v4.1-flash",
       "run_max_cost_usd": "0.75",
       "provider": {
-        "only": ["AkashML"],
+        "only": ["DeepInfra"],
         "allow_fallbacks": false,
         "require_parameters": true
       }
