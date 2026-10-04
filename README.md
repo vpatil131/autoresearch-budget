@@ -4,7 +4,7 @@ Small models drive a software experimentation loop and consult a frontier model 
 
 ## Status
 
-Initial research started on October 3, 2026. No paid model calls or benchmark executions have been made. The experiment runner and empirically validated subset are not implemented yet. The presentation's implementation and illustrative results are unverified inputs, not a baseline or architecture constraint for this project.
+Initial research started on October 3, 2026. No paid model calls have been made. Harbor 0.23.0 has now been smoke-tested on one Python task and one Go task: both unmodified checkouts scored 0 and both packaged oracle solutions scored 1. The experiment runner and empirically validated model-gap subset are not implemented yet. The presentation's implementation and illustrative results are unverified inputs, not a baseline or architecture constraint for this project.
 
 The local `.env` uses `OPENROUTER_KEY`; the eventual runner must accept it and supply the `OPENROUTER_API_KEY` expected by the agent library without logging either value or passing credentials to task containers.
 
@@ -20,6 +20,10 @@ The local `.env` uses `OPENROUTER_KEY`; the eventual runner must accept it and s
 - The SWE-rebench and SWE-rebench V2 images inspected on Docker Hub are `linux/amd64`, not `linux/arm64` multi-architecture images. This Apple Silicon Mac can attempt them through Docker's x86 emulation, but compatibility and runtime cost must be measured. Do not assume local Mac execution is suitable for the experiment.
 - Harbor also supports remote sandbox backends, including Modal, EC2, Daytona, and others. An x86 Linux backend is an execution option if local emulation is slow or unreliable; Daytona has no privileged status in this project.
 - mini-SWE-agent is one candidate scaffold because it is small and supports OpenRouter. It has not been selected. Compare it with a minimal project-owned loop and Harbor's relevant pre-integrated agents using the same tasks, budgets, and model settings before freezing the harness.
+- The downloaded July package contains 111 tasks across 65 repositories and occupies 11 MB before images. A generated manifest at `research/july_2026_manifest.json` contains identities, public metadata, resource requests, and verifier shape without copying oracle or test patch bodies.
+- Zero-inference validation passed on `teng-lin__notebooklm-py-826` (Python/pytest) and `gotd__td-1759` (Go/go test). In each case, the base image matched the declared base commit, contained neither `/tests` nor `/solution`, the no-op run scored 0, and the oracle run scored 1.
+- Docker Desktop's credential helper hung on anonymous pulls on this host. `scripts/with_anonymous_docker.sh` works around it with an ephemeral credential-free Docker config while retaining Docker Compose. It does not modify the user's persistent Docker configuration.
+- Both tested images are `linux/amd64`; execution reported `x86_64` inside the containers, confirming emulation. Cached environment setup plus verification took roughly 8–14 seconds for the selected tasks, but downloading the two images reduced host free space from 66 GiB to 59 GiB. Local serial execution is viable for cheap tasks, while broader screening still needs image-size and resource filtering.
 
 ## Proposed implementation
 
