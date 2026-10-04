@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "autoresearch-budget"
+version = "0.1.0"
+description = "Budget-controlled SWE-rebench experiment runner"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+autoresearch-budget = "autoresearch_budget.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/autoresearch_budget"]
+

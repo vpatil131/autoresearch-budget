@@ -1,0 +1,110 @@
+"""Local control commands that never call a model implicitly."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import shlex
+import tempfile
+from dataclasses import asdict
+from decimal import Decimal
+from pathlib import Path
+
+from .agent import AgentLimits, ExecResult, MinimalShellAgent
+from .budget import BudgetLedger
+from .models import ScriptedModel
+from .runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, TrialSpec
+from .store import RunStore
+
+
+class _MockSandbox:
+    def __init__(self):
+        self.commands: list[str] = []
+
+    async def exec(self, command: str, *, timeout_sec: int) -> ExecResult:
+        del timeout_sec
+        self.commands.append(command)
+        return ExecResult(stdout="README.md\n", stderr="", return_code=0)
+
+
+async def _mock_run(output: Path) -> dict[str, object]:
+    store = RunStore(output)
+    model = ScriptedModel(
+        [
+            '{"action":"shell","command":"git status --short"}',
+            '{"action":"finish","summary":"Mock run completed."}',
+        ]
+    )
+    sandbox = _MockSandbox()
+    agent = MinimalShellAgent(
+        model=model,
+        sandbox=sandbox,
+        store=store,
+        run_id="mock-run",
+        limits=AgentLimits(
+            max_steps=3, max_tokens_per_call=128, command_timeout_sec=5
+        ),
+    )
+    store.write_metadata({"network": False, "model": "mock/scripted"})
+    outcome = await agent.run("Inspect the repository and report status.")
+    return {"outcome": asdict(outcome), "commands": sandbox.commands}
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="autoresearch-budget")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    budget = commands.add_parser("budget", help="manage the inference ledger")
+    budget_commands = budget.add_subparsers(dest="budget_command", required=True)
+    for name in ("init", "show"):
+        command = budget_commands.add_parser(name)
+        command.add_argument("--db", type=Path, required=True)
+        command.add_argument("--cap-usd", type=Decimal, required=True)
+
+    mock = commands.add_parser("mock-run", help="zero-network scaffold smoke test")
+    mock.add_argument("--output", type=Path)
+
+    trial = commands.add_parser("trial", help="plan or run one Harbor model trial")
+    trial_commands = trial.add_subparsers(dest="trial_command", required=True)
+    for name in ("plan", "run"):
+        command = trial_commands.add_parser(name)
+        command.add_argument("--config", type=Path, required=True)
+        command.add_argument("--profile", required=True)
+        command.add_argument("--task-id", required=True)
+        command.add_argument("--attempt", type=int, default=1)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command == "budget":
+        ledger = BudgetLedger(args.db, args.cap_usd)
+        print(json.dumps(asdict(ledger.snapshot()), default=str, indent=2))
+        return 0
+    if args.command == "mock-run":
+        if args.output:
+            output = args.output
+            result = asyncio.run(_mock_run(output))
+        else:
+            with tempfile.TemporaryDirectory(prefix="autoresearch-mock-") as temp:
+                result = asyncio.run(_mock_run(Path(temp)))
+        print(json.dumps(result, default=str, indent=2))
+        return 0
+    if args.command == "trial":
+        try:
+            config = ExperimentConfig.load(args.config, project_root=Path.cwd())
+            runner = HarborTrialRunner(config)
+            spec = TrialSpec(args.task_id, args.profile, args.attempt)
+            if args.trial_command == "plan":
+                print(shlex.join(runner.command(spec)))
+                return 0
+            return runner.run(spec)
+        except RunnerConfigError as error:
+            print(f"error: {error}")
+            return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

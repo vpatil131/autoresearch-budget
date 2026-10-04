@@ -4,9 +4,9 @@ Small models drive a software experimentation loop and consult a frontier model 
 
 ## Status
 
-Initial research started on October 3, 2026. No paid model calls have been made. Harbor 0.23.0 has now been smoke-tested on one Python task and one Go task: both unmodified checkouts scored 0 and both packaged oracle solutions scored 1. The experiment runner and empirically validated model-gap subset are not implemented yet. The presentation's implementation and illustrative results are unverified inputs, not a baseline or architecture constraint for this project.
+Initial research started on October 3, 2026. No paid model calls have been made. Harbor 0.23.0 has now been smoke-tested on one Python task and one Go task: both unmodified checkouts scored 0 and both packaged oracle solutions scored 1. A first project-owned external-agent scaffold, durable run store, OpenRouter adapter, and SQLite budget ledger are implemented and tested offline. The custom scaffold also completed Harbor's full agent/container/verifier lifecycle with a scripted zero-network model and received the expected reward 0 on an unchanged task. The empirically validated model-gap subset is not selected yet. The presentation's implementation and illustrative results are unverified inputs, not a baseline or architecture constraint for this project.
 
-The local `.env` uses `OPENROUTER_KEY`; the eventual runner must accept it and supply the `OPENROUTER_API_KEY` expected by the agent library without logging either value or passing credentials to task containers.
+The local `.env` uses `OPENROUTER_KEY`. The launcher accepts it, supplies `OPENROUTER_API_KEY` to the host-side adapter, and does not log either value or pass credentials to task containers.
 
 ## Findings
 
@@ -36,6 +36,33 @@ Docker is not needed to call OpenRouter; inference happens at the provider. Cont
 Pin the agent version, task distribution revision, repository commit, prompts, reasoning settings, provider routing, and image digest. Record patches, trajectories, token usage including reasoning and cached tokens, actual billed cost, test outcomes, elapsed time, infrastructure errors, and advisor calls. Use resumable task/run IDs and reserve worst-case request cost before issuing a call so concurrent runs cannot overspend.
 
 Expose a common action contract to both models and verify the OpenRouter adapter's compatibility with the selected pair. Shell-only, native tool calls, and any existing scaffold are implementation candidates to measure, rather than assumptions inherited from the talk. The advisor gets a compact evidence packet and returns diagnosis or a suggested experiment; the small actor owns edits and execution.
+
+The initial common contract is implemented in `src/autoresearch_budget`. `BudgetShellAgent` is a Harbor external agent: model requests stay on the host, only shell commands execute inside Harbor's task environment, and Harbor independently runs the verifier afterward. It records every response, command, observation, billed `usage.cost`, token counters, the final patch, and the final repository status. The SQLite ledger reserves each run's maximum amount atomically before dispatch. Network timeouts and responses without a billed cost remain held as uncertain spend until reconciled. Paid inference also requires the explicit `allow_paid` agent option; the example configuration leaves it disabled. Since a provider can bill a single completed request above an inaccurate estimate, calibration must set conservative run reservations and the OpenRouter key should carry the confirmed account-side spending limit. Any observed reservation overrun is recorded at its actual cost and blocks later work as needed.
+
+Run the zero-network validation with:
+
+```sh
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m autoresearch_budget.cli mock-run
+```
+
+Plan a real single-task trial without executing it or reading the API key:
+
+```sh
+PYTHONPATH=src python3 -m autoresearch_budget.cli trial plan \
+  --config config/experiment.example.json \
+  --profile small \
+  --task-id teng-lin__notebooklm-py-826
+```
+
+`trial run` refuses to start while `paid_inference_enabled` is false. For an
+approved calibration, copy the example to an ignored local config, set the
+confirmed total and per-run caps, enable paid inference, and use `trial run`
+with the same arguments. The launcher reads the key without placing it in the
+command line and runs trials serially. Use `scripts/run_budget_shell_mock.sh`
+to repeat the end-to-end Harbor check without network inference.
+
+The next validation is a matched 2–3 task comparison between this scaffold and Harbor's mini-SWE-agent integration. That comparison begins only after one compatibility request per selected model establishes the provider route, reasoning controls, returned cost fields, and conservative per-run reservation.
 
 Agent containers receive the issue, base repository, and public tests. Oracle patches, benchmark test patches, verifier scripts, solution-bearing repository history, and benchmark verdicts stay outside the actor/advisor context. Audit prebuilt images for these artifacts. Use final independent grading for selection and reporting, while controller triggers use only actor-visible evidence. Verify both that the unmodified repository fails required issue tests and that the gold solution passes with regression tests preserved.
 

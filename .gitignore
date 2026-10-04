@@ -11,3 +11,4 @@ data/harbor/
 runs/
 logs/
 vendor/
+config/experiment.local.json
