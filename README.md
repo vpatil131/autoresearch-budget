@@ -4,7 +4,7 @@ Small models drive a software experimentation loop and consult a frontier model 
 
 ## Status
 
-Research completed on October 3, 2026. No paid model calls or benchmark executions have been made. The experiment runner and empirically validated subset are not implemented yet. The presentation's illustrative results are not experimental evidence for this project.
+Initial research started on October 3, 2026. No paid model calls or benchmark executions have been made. The experiment runner and empirically validated subset are not implemented yet. The presentation's implementation and illustrative results are unverified inputs, not a baseline or architecture constraint for this project.
 
 The local `.env` uses `OPENROUTER_KEY`; the eventual runner must accept it and supply the `OPENROUTER_API_KEY` expected by the agent library without logging either value or passing credentials to task containers.
 
@@ -16,30 +16,33 @@ The local `.env` uses `OPENROUTER_KEY`; the eventual runner must accept it and s
 - Harbor's July snapshot advertises 111 hard tasks across Go, Java, Python, Rust, and TypeScript, version 1.0.0, revision 1. It is a snapshot label, not a guarantee that tasks were created in July.
 - The public leaderboard's May 15–July 1, 2026 window reports Qwen3.6-35B-A3B at 24.7% mean resolved rate and GPT-5.6 Sol medium at 62.3%. These now correspond to the selected model names, but remain aggregate results under the leaderboard's setup rather than verified per-task results under our runner. Python alone has a 14% vs 48% gap in this window, but only 20 tasks; a Python-only pool may not yield enough stable differential tasks.
 - The inspected page payload exposes task identities and aggregate statistics, not individual task verdicts. No reusable exact-pair outcome matrix has been established.
-- Docker is running locally on ARM64. Published older evaluation images are x86_64. Start with a small local smoke run and measure emulation overhead before deciding whether an x86 Linux worker is necessary.
-- mini-SWE-agent v2 supports OpenRouter Chat Completions, Responses, and text-action adapters. Choose one common action interface and verify support for the selected model pair before freezing the runner.
+- Harbor supports local `docker` as its default sandbox on macOS when Docker Desktop or another compatible Docker runtime is installed. Harbor does not provide a special macOS task environment or verifier; it launches the task's container through the selected sandbox backend.
+- The SWE-rebench and SWE-rebench V2 images inspected on Docker Hub are `linux/amd64`, not `linux/arm64` multi-architecture images. This Apple Silicon Mac can attempt them through Docker's x86 emulation, but compatibility and runtime cost must be measured. Do not assume local Mac execution is suitable for the experiment.
+- Harbor also supports remote sandbox backends, including Modal, EC2, Daytona, and others. An x86 Linux backend is an execution option if local emulation is slow or unreliable; Daytona has no privileged status in this project.
+- mini-SWE-agent is one candidate scaffold because it is small and supports OpenRouter. It has not been selected. Compare it with a minimal project-owned loop and Harbor's relevant pre-integrated agents using the same tasks, budgets, and model settings before freezing the harness.
 
 ## Proposed implementation
 
-Use mini-SWE-agent as the common actor scaffold, with a small project wrapper for dataset selection, budget accounting, advice checkpoints, and result collection. For the July tasks, use Harbor's task environments and verifiers. For older Hugging Face tasks, use the SWE-rebench SWE-bench fork. Keep those evaluation paths explicit rather than treating their task formats as interchangeable.
+Treat the benchmark evaluator and the agent scaffold as separate choices. First validate Harbor's July task packaging and verifier against the source SWE-rebench data and gold behavior. Independently compare candidate agent loops using a few tasks. Select the simplest scaffold that gives both models the same effective tools, preserves complete trajectories and costs, and reproduces expected grading. A small project-owned loop is acceptable and may be preferable if an existing agent adds hidden retries, summarization, model-specific behavior, or difficult-to-control token usage.
 
-These are different components, not two agents. mini-SWE-agent is the agent loop that asks the chosen model for an action and executes it. Harbor is the benchmark execution framework: a task environment contains the pinned repository and dependencies, and its verifier independently runs tests and grades the submitted change. The same mini-SWE-agent implementation drives both standalone models. The frontier advisor only returns advice.
+Harbor is a benchmark execution framework, not a required agent. A task environment contains the pinned repository and dependencies, and its verifier independently runs tests and grades the submitted change. Whichever agent loop we select must drive both standalone models under the same interface. The frontier advisor only returns advice.
 
-Docker is not needed to call OpenRouter or run either model locally: model inference happens on the provider. It supplies disposable, reproducible execution environments for repository code and tests. Native environments are possible but require managing conflicting dependencies and rebuilding equivalent isolation. Use the existing Docker installation for the first smoke runs, without introducing Kubernetes or provisioning a remote server. Revisit execution infrastructure only if measured compatibility or speed requires it.
+Docker is not needed to call OpenRouter; inference happens at the provider. Containers supply disposable, reproducible environments for repository code and tests. On this Mac, run one zero-inference verifier/gold smoke test and one short agent task before relying on local Docker. Record wall time, peak memory, image-pull size, architecture warnings, test result, and any emulation failures. If it is unsuitable, move task execution to an x86 Linux sandbox while keeping inference and the experimental design unchanged.
 
 Pin the agent version, task distribution revision, repository commit, prompts, reasoning settings, provider routing, and image digest. Record patches, trajectories, token usage including reasoning and cached tokens, actual billed cost, test outcomes, elapsed time, infrastructure errors, and advisor calls. Use resumable task/run IDs and reserve worst-case request cost before issuing a call so concurrent runs cannot overspend.
 
-Expose a common shell-action contract to both models and verify the OpenRouter adapter's compatibility with the selected pair. The advisor gets a compact evidence packet and returns diagnosis or a suggested experiment; the small actor owns edits and execution.
+Expose a common action contract to both models and verify the OpenRouter adapter's compatibility with the selected pair. Shell-only, native tool calls, and any existing scaffold are implementation candidates to measure, rather than assumptions inherited from the talk. The advisor gets a compact evidence packet and returns diagnosis or a suggested experiment; the small actor owns edits and execution.
 
 Agent containers receive the issue, base repository, and public tests. Oracle patches, benchmark test patches, verifier scripts, solution-bearing repository history, and benchmark verdicts stay outside the actor/advisor context. Audit prebuilt images for these artifacts. Use final independent grading for selection and reporting, while controller triggers use only actor-visible evidence. Verify both that the unmodified repository fails required issue tests and that the gold solution passes with regression tests preserved.
 
 ## Proposed discovery sequence
 
-1. The model pair is selected. Resolve an overall spending cap, test one short request per model, then run 2–3 complete tasks. Validate endpoint behavior, cost logging, patch extraction, and grading before scaling.
-2. Inspect the July task manifest, filter for reproducible CPU environments and clear instructions, and measure evaluator runtime with gold checks. Favor cheap tests and diverse repositories. Avoid selecting only tiny gold patches as a proxy for difficulty. Keep a manifest of all exclusions and deduplicate by task ID/base commit.
-3. Screen 20 candidates first. Run the small model once. Run Sol on valid small-model failures first, then expand in batches of 10–20 as the budget permits. Infrastructure failures do not count as model failures. This sequence reduces frontier spending during discovery.
-4. Repeat both standalone baselines twice more on promising differential tasks, from clean workspaces and under the same prompts, tools, and step/time limits. A provisional eligibility rule is small model 0/3 solved and Sol at least 2/3 solved. Three runs provide a screening estimate, not a precise probability. Retain failure categories and cost distributions.
-5. Freeze 10–20 eligible tasks, ideally 15–20, spanning several repositories and failure types. If fewer qualify, report the shortfall and expand within budget instead of weakening the rule invisibly. Freeze the manifest before tuning advice; reserve roughly one third for evaluation and split by repository where feasible. Neither policy tuning nor advisor context can access reserved-task oracle artifacts or validation outcomes.
+1. Validate the evaluation layer without model inference: inspect the July manifest, audit task/verifier isolation, run the unmodified and gold patches on 1–2 tasks, and measure local Mac Docker compatibility. Compare the result against the source SWE-rebench evaluator where practical.
+2. Compare candidate agent scaffolds on 2–3 tasks using short, capped runs. Select the scaffold based on controllability, parity across the two models, complete cost/trajectory capture, and successful grading. Then test one normal request per model and 2–3 complete task runs before scaling.
+3. Inspect the full candidate manifest, filter for reproducible CPU environments and clear instructions, and measure evaluator runtime with gold checks. Favor cheap tests and diverse repositories. Avoid selecting only tiny gold patches as a proxy for difficulty. Keep a manifest of all exclusions and deduplicate by task ID/base commit.
+4. Screen 20 candidates first. Run the small model once. Run Sol on valid small-model failures first, then expand in batches of 10–20 as the budget permits. Infrastructure failures do not count as model failures. This sequence reduces frontier spending during discovery.
+5. Repeat both standalone baselines twice more on promising differential tasks, from clean workspaces and under the same prompts, tools, and step/time limits. A provisional eligibility rule is small model 0/3 solved and Sol at least 2/3 solved. Three runs provide a screening estimate, not a precise probability. Retain failure categories and cost distributions.
+6. Freeze 10–20 eligible tasks, ideally 15–20, spanning several repositories and failure types. If fewer qualify, report the shortfall and expand within budget instead of weakening the rule invisibly. Freeze the manifest before tuning advice; reserve roughly one third for evaluation and split by repository where feasible. Neither policy tuning nor advisor context can access reserved-task oracle artifacts or validation outcomes.
 
 Prefer the 111-task July pool, starting with Python and inexpensive Go/TypeScript tasks and expanding by measured environment cost. Use the older 110-task `2026_03` Hugging Face split if the Harbor path blocks progress. Record task dates relative to documented model cutoffs and avoid claims of complete decontamination where cutoff/training exposure is unknown.
 
@@ -70,5 +73,7 @@ The leaderboard window reports approximately $0.27/task for Qwen3.6 and $0.85/ta
 - [Qwen3.6-35B-A3B providers](https://openrouter.ai/qwen/qwen3.6-35b-a3b)
 - [GPT-5.6 Sol on OpenRouter](https://openrouter.ai/openai/gpt-5.6-sol)
 - [GPT-5.6 Sol official model guidance](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
-- [Harbor environments and verifiers](https://docs.harborframework.com/core-concepts)
+- [Harbor local and remote sandboxes](https://docs.harborframework.com/sandboxes/pre-integrated-sandboxes)
+- [Harbor verifier contract](https://docs.harborframework.com/tasks/verifier)
+- [SWE-rebench V2 Docker images](https://hub.docker.com/u/swerebenchv2)
 
