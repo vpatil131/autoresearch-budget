@@ -11,6 +11,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .budget import BudgetLedger
+
 
 class RunnerConfigError(ValueError):
     pass
@@ -81,6 +83,8 @@ class TrialSpec:
 
 class HarborTrialRunner:
     AGENT_IMPORT = "autoresearch_budget.harbor_agent:BudgetShellAgent"
+    MINI_SWE_AGENT = "mini-swe-agent"
+    SUPPORTED_SCAFFOLDS = {"budget-shell", MINI_SWE_AGENT}
 
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -97,41 +101,25 @@ class HarborTrialRunner:
         profile = self.config.profiles[spec.profile]
         task_dir = task_dir or self.config.task_root / spec.task_id
         job_name = f"{spec.profile}-{spec.task_id}-a{spec.attempt}"
+        scaffold = self._scaffold()
         command = [
             *self._harbor_prefix(),
             "run",
             "--path",
             str(task_dir),
             "--agent",
-            self.AGENT_IMPORT,
+            (
+                self.MINI_SWE_AGENT
+                if scaffold == self.MINI_SWE_AGENT
+                else self.AGENT_IMPORT
+            ),
             "--model",
-            profile.model,
-            "--ak",
-            f"budget_db={self.config.budget_db}",
-            "--ak",
-            f"budget_cap_usd={self.config.budget_cap_usd}",
-            "--ak",
-            f"run_max_cost_usd={profile.run_max_cost_usd}",
-            "--ak",
-            f"max_steps={int(self.config.agent['max_steps'])}",
-            "--ak",
-            f"max_tokens_per_call={int(self.config.agent['max_tokens_per_call'])}",
-            "--ak",
-            f"command_timeout_sec={int(self.config.agent['command_timeout_sec'])}",
-            "--ak",
-            f"max_observation_chars={int(self.config.agent['max_observation_chars'])}",
-            "--ak",
-            "allow_paid=true",
+            self._harbor_model(profile),
         ]
-        if profile.reasoning_effort:
-            command.extend(["--ak", f"reasoning_effort={profile.reasoning_effort}"])
-        if profile.provider:
-            command.extend(
-                [
-                    "--ak",
-                    "provider=" + json.dumps(profile.provider, separators=(",", ":")),
-                ]
-            )
+        if scaffold == self.MINI_SWE_AGENT:
+            command.extend(self._mini_swe_agent_args(profile))
+        else:
+            command.extend(self._budget_shell_args(profile))
         command.extend(
             [
                 "--n-concurrent",
@@ -153,7 +141,7 @@ class HarborTrialRunner:
         task_dir = self.config.task_root / spec.task_id
         if not task_dir.is_dir():
             raise RunnerConfigError(f"task directory does not exist: {task_dir}")
-        prepared_task_dir = self._prepare_isolated_task(spec, task_dir)
+        prepared_task_dir = self._prepare_task(spec, task_dir)
         environment = dict(os.environ)
         environment.update(_read_env_file(self.config.project_root / env_file))
         api_key = environment.get("OPENROUTER_API_KEY") or environment.get(
@@ -172,16 +160,56 @@ class HarborTrialRunner:
             else source_path
         )
         self.config.jobs_root.mkdir(parents=True, exist_ok=True)
-        completed = subprocess.run(
-            self.command(spec, task_dir=prepared_task_dir),
-            cwd=self.config.project_root,
-            env=environment,
-            check=False,
+        if self._scaffold() != self.MINI_SWE_AGENT:
+            completed = subprocess.run(
+                self.command(spec, task_dir=prepared_task_dir),
+                cwd=self.config.project_root,
+                env=environment,
+                check=False,
+            )
+            return completed.returncode
+
+        profile = self.config.profiles[spec.profile]
+        job_name = self._job_name(spec)
+        reservation_id = f"harbor-mini:{job_name}"
+        ledger = BudgetLedger(self.config.budget_db, self.config.budget_cap_usd)
+        ledger.reserve(
+            reservation_id,
+            run_id=job_name,
+            model=profile.model,
+            max_cost_usd=profile.run_max_cost_usd,
         )
+        try:
+            completed = subprocess.run(
+                self.command(spec, task_dir=prepared_task_dir),
+                cwd=self.config.project_root,
+                env=environment,
+                check=False,
+            )
+        except BaseException:
+            ledger.mark_uncertain(
+                reservation_id,
+                "Harbor mini-SWE-agent process was interrupted; verify "
+                "OpenRouter billing.",
+            )
+            raise
+
+        cost = _completed_job_cost(self.config.jobs_root / job_name / "result.json")
+        if cost is None:
+            ledger.mark_uncertain(
+                reservation_id,
+                "Harbor produced no completed job cost; verify OpenRouter billing.",
+            )
+        else:
+            ledger.reconcile(
+                reservation_id,
+                cost,
+                note="Reconciled from Harbor's completed job result.",
+            )
         return completed.returncode
 
-    def _prepare_isolated_task(self, spec: TrialSpec, source: Path) -> Path:
-        """Stage a task whose agent phase cannot reach the public internet."""
+    def _prepare_task(self, spec: TrialSpec, source: Path) -> Path:
+        """Stage a task with the scaffold's least-privilege agent network policy."""
         destination = (
             self.config.jobs_root
             / "_prepared_tasks"
@@ -194,11 +222,98 @@ class HarborTrialRunner:
         manifest = destination / "task.toml"
         if not manifest.is_file():
             raise RunnerConfigError(f"task manifest does not exist: {manifest}")
-        manifest.write_text(
-            _force_agent_no_network(manifest.read_text(encoding="utf-8")),
-            encoding="utf-8",
-        )
+        source_text = manifest.read_text(encoding="utf-8")
+        if self._scaffold() == self.MINI_SWE_AGENT:
+            source_text = _force_agent_network_policy(
+                source_text, "allowlist", ["openrouter.ai"]
+            )
+        else:
+            source_text = _force_agent_network_policy(source_text, "no-network")
+        manifest.write_text(source_text, encoding="utf-8")
         return destination
+
+    def _scaffold(self) -> str:
+        scaffold = str(self.config.agent.get("scaffold", "budget-shell"))
+        if scaffold not in self.SUPPORTED_SCAFFOLDS:
+            raise RunnerConfigError(
+                f"unsupported agent scaffold {scaffold!r}; expected one of "
+                f"{sorted(self.SUPPORTED_SCAFFOLDS)}"
+            )
+        return scaffold
+
+    @staticmethod
+    def _job_name(spec: TrialSpec) -> str:
+        return f"{spec.profile}-{spec.task_id}-a{spec.attempt}"
+
+    def _harbor_model(self, profile: ModelProfile) -> str:
+        if self._scaffold() == self.MINI_SWE_AGENT:
+            return f"openrouter/{profile.model}"
+        return profile.model
+
+    def _mini_swe_agent_args(self, profile: ModelProfile) -> list[str]:
+        version = str(self.config.agent.get("version", "2.4.6"))
+        child_env = {
+            # The mini-SWE process needs the key; its bash actions do not. The
+            # LocalEnvironment overlay masks credentials from model-run commands.
+            "OPENROUTER_API_KEY": "",
+            "MSWEA_API_KEY": "",
+        }
+        model_kwargs: dict[str, Any] = {
+            "drop_params": True,
+        }
+        if profile.provider:
+            model_kwargs["extra_body"] = {"provider": profile.provider}
+        config = {
+            "agent": {"step_limit": int(self.config.agent["max_steps"])},
+            "environment": {
+                "timeout": int(self.config.agent["command_timeout_sec"]),
+                "env": child_env,
+            },
+            "model": {"model_kwargs": model_kwargs},
+        }
+        args = [
+            "--ak",
+            f"version={version}",
+            "--ak",
+            f"cost_limit={profile.run_max_cost_usd}",
+            "--ak",
+            f"max_tokens={int(self.config.agent['max_tokens_per_call'])}",
+            "--ak",
+            "config=" + json.dumps(config, separators=(",", ":")),
+        ]
+        if profile.reasoning_effort:
+            args.extend(["--ak", f"reasoning_effort={profile.reasoning_effort}"])
+        return args
+
+    def _budget_shell_args(self, profile: ModelProfile) -> list[str]:
+        args = [
+            "--ak",
+            f"budget_db={self.config.budget_db}",
+            "--ak",
+            f"budget_cap_usd={self.config.budget_cap_usd}",
+            "--ak",
+            f"run_max_cost_usd={profile.run_max_cost_usd}",
+            "--ak",
+            f"max_steps={int(self.config.agent['max_steps'])}",
+            "--ak",
+            f"max_tokens_per_call={int(self.config.agent['max_tokens_per_call'])}",
+            "--ak",
+            f"command_timeout_sec={int(self.config.agent['command_timeout_sec'])}",
+            "--ak",
+            f"max_observation_chars={int(self.config.agent['max_observation_chars'])}",
+            "--ak",
+            "allow_paid=true",
+        ]
+        if profile.reasoning_effort:
+            args.extend(["--ak", f"reasoning_effort={profile.reasoning_effort}"])
+        if profile.provider:
+            args.extend(
+                [
+                    "--ak",
+                    "provider=" + json.dumps(profile.provider, separators=(",", ":")),
+                ]
+            )
+        return args
 
     def _harbor_prefix(self) -> list[str]:
         wrapper = str(self.config.project_root / "scripts/with_anonymous_docker.sh")
@@ -237,8 +352,17 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def _force_agent_no_network(source: str) -> str:
+def _force_agent_network_policy(
+    source: str, mode: str, allowed_hosts: list[str] | None = None
+) -> str:
     """Set Harbor's agent-phase network policy without rewriting unrelated TOML."""
+    if mode not in {"no-network", "allowlist", "public"}:
+        raise RunnerConfigError(f"unsupported network mode {mode!r}")
+    hosts = list(allowed_hosts or [])
+    if mode != "allowlist" and hosts:
+        raise RunnerConfigError("allowed hosts require allowlist mode")
+    if mode == "allowlist" and not hosts:
+        raise RunnerConfigError("allowlist mode requires at least one host")
     lines = source.splitlines(keepends=True)
     start = next(
         (index for index, line in enumerate(lines) if line.strip() == "[agent]"),
@@ -254,10 +378,30 @@ def _force_agent_no_network(source: str) -> str:
         ),
         len(lines),
     )
-    for index in range(start + 1, end):
-        if lines[index].split("=", 1)[0].strip() == "network_mode":
-            newline = "\n" if lines[index].endswith("\n") else ""
-            lines[index] = f'network_mode = "no-network"{newline}'
-            return "".join(lines)
-    lines.insert(start + 1, 'network_mode = "no-network"\n')
+    filtered = [
+        line
+        for line in lines[start + 1 : end]
+        if line.split("=", 1)[0].strip() not in {"network_mode", "allowed_hosts"}
+    ]
+    policy = [f'network_mode = "{mode}"\n']
+    if hosts:
+        policy.append(
+            "allowed_hosts = " + json.dumps(hosts, separators=(",", ":")) + "\n"
+        )
+    lines[start + 1 : end] = [*policy, *filtered]
     return "".join(lines)
+
+
+def _completed_job_cost(path: Path) -> Decimal | None:
+    """Read Harbor's aggregate cost only from a finished one-trial job."""
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if not result.get("finished_at") or result.get("n_total_trials") != 1:
+            return None
+        raw_cost = result["stats"]["cost_usd"]
+        cost = Decimal(str(raw_cost))
+        if not cost.is_finite() or cost < 0:
+            return None
+        return cost
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None

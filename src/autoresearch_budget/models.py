@@ -73,6 +73,7 @@ class OpenRouterClient:
         endpoint: str = "https://openrouter.ai/api/v1/chat/completions",
         timeout_sec: float = 180.0,
         transport: Transport = _default_transport,
+        retry_delays_sec: tuple[float, ...] = (2.0, 4.0, 8.0),
     ):
         if not allow_paid:
             raise ValueError("paid inference is disabled; pass allow_paid=True explicitly")
@@ -85,6 +86,7 @@ class OpenRouterClient:
         self.endpoint = endpoint
         self.timeout_sec = timeout_sec
         self.transport = transport
+        self.retry_delays_sec = retry_delays_sec
 
     async def complete(
         self,
@@ -117,13 +119,19 @@ class OpenRouterClient:
             },
             method="POST",
         )
-        status, raw = await asyncio.to_thread(
-            self.transport, request, self.timeout_sec
-        )
-        try:
-            response = json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise ModelError(f"OpenRouter returned non-JSON HTTP {status}") from error
+        for attempt in range(len(self.retry_delays_sec) + 1):
+            status, raw = await asyncio.to_thread(
+                self.transport, request, self.timeout_sec
+            )
+            try:
+                response = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise ModelError(
+                    f"OpenRouter returned non-JSON HTTP {status}"
+                ) from error
+            if status != 429 or attempt == len(self.retry_delays_sec):
+                break
+            await asyncio.sleep(self.retry_delays_sec[attempt])
         if status < 200 or status >= 300:
             raise ModelError(f"OpenRouter HTTP {status}: {_error_message(response)}")
         if response.get("error"):

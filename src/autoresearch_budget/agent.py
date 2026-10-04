@@ -22,6 +22,16 @@ or
 
 The shell command runs in the repository working directory. Never attempt to read
 benchmark solutions, hidden tests, verifier files, credentials, or host files.
+The task environment has no network access during your work. Do not attempt to
+download packages or query public services. If a visible test cannot run because
+an uncached dependency is unavailable, continue with repository-local inspection
+and static validation instead of retrying the download.
+Work in tracked repository source, not vendored dependencies or node_modules.
+Do not run package installers or modify lockfiles unless the issue explicitly
+requires a dependency change. Locate the relevant source quickly, implement a
+focused fix, and reserve the final quarter of the step budget for tests, diff
+review, and correction. Batch related read-only inspection in one shell action
+when practical.
 Finish only after checking the diff and running relevant visible tests when feasible.
 """
 

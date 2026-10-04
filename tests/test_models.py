@@ -98,6 +98,51 @@ class OpenRouterClientTest(unittest.TestCase):
         self.assertEqual(completion.cost_usd, Decimal("0.004"))
         self.assertEqual(completion.reasoning_tokens, 128)
 
+    def test_retries_explicit_429_before_returning_completion(self):
+        responses = [
+            (
+                429,
+                json.dumps(
+                    {"error": {"message": "Provider returned error"}}
+                ).encode(),
+            ),
+            (
+                200,
+                json.dumps(
+                    {
+                        "id": "generation-2",
+                        "model": "qwen/example",
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {
+                                    "content": '{"action":"finish","summary":"ok"}'
+                                },
+                            }
+                        ],
+                        "usage": {"cost": 0.001},
+                    }
+                ).encode(),
+            ),
+        ]
+
+        def transport(request, timeout):
+            del request, timeout
+            return responses.pop(0)
+
+        client = OpenRouterClient(
+            api_key="test",
+            model="qwen/example",
+            allow_paid=True,
+            transport=transport,
+            retry_delays_sec=(0,),
+        )
+        completion = asyncio.run(
+            client.complete([], request_id="retry-test", max_tokens=100)
+        )
+        self.assertEqual(completion.response_id, "generation-2")
+        self.assertEqual(responses, [])
+
 
 if __name__ == "__main__":
     unittest.main()

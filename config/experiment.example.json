@@ -8,10 +8,11 @@
     "jobs_root": "runs/trials"
   },
   "agent": {
-    "scaffold": "budget-shell",
-    "max_steps": 20,
-    "max_tokens_per_call": 2048,
-    "command_timeout_sec": 300,
+    "scaffold": "mini-swe-agent",
+    "version": "2.4.6",
+    "max_steps": 40,
+    "max_tokens_per_call": 4096,
+    "command_timeout_sec": 120,
     "max_observation_chars": 20000
   },
   "profiles": {
@@ -19,7 +20,7 @@
       "model": "qwen/qwen3.6-35b-a3b",
       "run_max_cost_usd": "0.75",
       "provider": {
-        "only": ["Darkbloom"],
+        "only": ["AkashML"],
         "allow_fallbacks": false,
         "require_parameters": true
       }
