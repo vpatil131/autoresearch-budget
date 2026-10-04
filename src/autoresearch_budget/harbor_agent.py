@@ -30,7 +30,14 @@ class _HarborSandbox:
         self.environment = environment
 
     async def exec(self, command: str, *, timeout_sec: int) -> ExecResult:
-        result = await self.environment.exec(command=command, timeout_sec=timeout_sec)
+        try:
+            result = await self.environment.exec(
+                command=command, timeout_sec=timeout_sec
+            )
+        except RuntimeError as error:
+            if "timed out after" in str(error).lower():
+                raise TimeoutError(str(error)) from error
+            raise
         return ExecResult(
             stdout=result.stdout or "",
             stderr=result.stderr or "",

@@ -136,7 +136,13 @@ class OpenRouterClient:
             raise ModelError(f"OpenRouter generation error: {_error_message(choice)}")
         message = choice.get("message") or {}
         content = message.get("content")
-        if not isinstance(content, str):
+        # Reasoning models can consume their entire output allowance before
+        # emitting final text. Preserve the usage and billed cost so the caller
+        # can reconcile the reservation, then treat the empty final as a format
+        # failure at the agent/probe layer.
+        if content is None:
+            content = ""
+        elif not isinstance(content, str):
             raise ModelError("OpenRouter response contained no text content")
         usage = response.get("usage") or {}
         prompt_details = usage.get("prompt_tokens_details") or {}
@@ -191,4 +197,3 @@ class ScriptedModel:
             served_model=self.model,
             cost_usd=Decimal("0"),
         )
-

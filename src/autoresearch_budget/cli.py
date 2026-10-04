@@ -14,6 +14,7 @@ from pathlib import Path
 from .agent import AgentLimits, ExecResult, MinimalShellAgent
 from .budget import BudgetLedger
 from .models import ScriptedModel
+from .probe import run_probe
 from .runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, TrialSpec
 from .store import RunStore
 
@@ -73,6 +74,12 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--profile", required=True)
         command.add_argument("--task-id", required=True)
         command.add_argument("--attempt", type=int, default=1)
+
+    probe = commands.add_parser("probe", help="run one low-cost model probe")
+    probe.add_argument("--config", type=Path, required=True)
+    probe.add_argument("--profile", required=True)
+    probe.add_argument("--max-cost-usd", type=Decimal, required=True)
+    probe.add_argument("--max-tokens", type=int, default=128)
     return parser
 
 
@@ -102,6 +109,22 @@ def main(argv: list[str] | None = None) -> int:
             return runner.run(spec)
         except RunnerConfigError as error:
             print(f"error: {error}")
+            return 2
+    if args.command == "probe":
+        try:
+            config = ExperimentConfig.load(args.config, project_root=Path.cwd())
+            result = asyncio.run(
+                run_probe(
+                    config,
+                    profile_name=args.profile,
+                    max_cost_usd=args.max_cost_usd,
+                    max_tokens=args.max_tokens,
+                )
+            )
+            print(json.dumps(asdict(result), default=str, indent=2))
+            return 0 if result.action_format_valid else 1
+        except Exception as error:
+            print(f"error: {type(error).__name__}: {error}")
             return 2
     return 2
 

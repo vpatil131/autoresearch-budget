@@ -60,7 +60,44 @@ class OpenRouterClientTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpenRouterClient(api_key="secret", model="mock/model")
 
+    def test_reasoning_only_response_preserves_cost_for_reconciliation(self):
+        def transport(request, timeout):
+            del request, timeout
+            response = {
+                "id": "reasoning-only",
+                "model": "qwen/example",
+                "choices": [
+                    {
+                        "message": {"content": None, "reasoning": "internal"},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 128,
+                    "cost": 0.004,
+                    "completion_tokens_details": {"reasoning_tokens": 128},
+                },
+            }
+            return 200, json.dumps(response).encode()
+
+        client = OpenRouterClient(
+            api_key="secret",
+            model="qwen/example",
+            allow_paid=True,
+            transport=transport,
+        )
+        completion = asyncio.run(
+            client.complete(
+                [{"role": "user", "content": "probe"}],
+                request_id="probe",
+                max_tokens=128,
+            )
+        )
+        self.assertEqual(completion.content, "")
+        self.assertEqual(completion.cost_usd, Decimal("0.004"))
+        self.assertEqual(completion.reasoning_tokens, 128)
+
 
 if __name__ == "__main__":
     unittest.main()
-

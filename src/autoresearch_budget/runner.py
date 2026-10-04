@@ -85,7 +85,9 @@ class HarborTrialRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
 
-    def command(self, spec: TrialSpec) -> list[str]:
+    def command(
+        self, spec: TrialSpec, *, task_dir: Path | None = None
+    ) -> list[str]:
         if spec.profile not in self.config.profiles:
             raise RunnerConfigError(f"unknown model profile {spec.profile!r}")
         if spec.attempt < 1:
@@ -93,7 +95,7 @@ class HarborTrialRunner:
         if "/" in spec.task_id or spec.task_id in (".", ".."):
             raise RunnerConfigError("task_id must be one task directory name")
         profile = self.config.profiles[spec.profile]
-        task_dir = self.config.task_root / spec.task_id
+        task_dir = task_dir or self.config.task_root / spec.task_id
         job_name = f"{spec.profile}-{spec.task_id}-a{spec.attempt}"
         command = [
             *self._harbor_prefix(),
@@ -151,6 +153,7 @@ class HarborTrialRunner:
         task_dir = self.config.task_root / spec.task_id
         if not task_dir.is_dir():
             raise RunnerConfigError(f"task directory does not exist: {task_dir}")
+        prepared_task_dir = self._prepare_isolated_task(spec, task_dir)
         environment = dict(os.environ)
         environment.update(_read_env_file(self.config.project_root / env_file))
         api_key = environment.get("OPENROUTER_API_KEY") or environment.get(
@@ -170,12 +173,32 @@ class HarborTrialRunner:
         )
         self.config.jobs_root.mkdir(parents=True, exist_ok=True)
         completed = subprocess.run(
-            self.command(spec),
+            self.command(spec, task_dir=prepared_task_dir),
             cwd=self.config.project_root,
             env=environment,
             check=False,
         )
         return completed.returncode
+
+    def _prepare_isolated_task(self, spec: TrialSpec, source: Path) -> Path:
+        """Stage a task whose agent phase cannot reach the public internet."""
+        destination = (
+            self.config.jobs_root
+            / "_prepared_tasks"
+            / f"{spec.profile}-{spec.task_id}-a{spec.attempt}"
+        )
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination)
+        manifest = destination / "task.toml"
+        if not manifest.is_file():
+            raise RunnerConfigError(f"task manifest does not exist: {manifest}")
+        manifest.write_text(
+            _force_agent_no_network(manifest.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+        return destination
 
     def _harbor_prefix(self) -> list[str]:
         wrapper = str(self.config.project_root / "scripts/with_anonymous_docker.sh")
@@ -213,3 +236,28 @@ def _read_env_file(path: Path) -> dict[str, str]:
         values[key] = value
     return values
 
+
+def _force_agent_no_network(source: str) -> str:
+    """Set Harbor's agent-phase network policy without rewriting unrelated TOML."""
+    lines = source.splitlines(keepends=True)
+    start = next(
+        (index for index, line in enumerate(lines) if line.strip() == "[agent]"),
+        None,
+    )
+    if start is None:
+        raise RunnerConfigError("task.toml has no [agent] section")
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].lstrip().startswith("[")
+        ),
+        len(lines),
+    )
+    for index in range(start + 1, end):
+        if lines[index].split("=", 1)[0].strip() == "network_mode":
+            newline = "\n" if lines[index].endswith("\n") else ""
+            lines[index] = f'network_mode = "no-network"{newline}'
+            return "".join(lines)
+    lines.insert(start + 1, 'network_mode = "no-network"\n')
+    return "".join(lines)

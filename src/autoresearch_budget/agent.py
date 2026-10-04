@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import Protocol
 
-from .models import CompletionBackend, RequestOutcomeUnknown
+from .models import CompletionBackend, ModelError, RequestOutcomeUnknown
 from .store import RunStore
 
 
@@ -111,6 +111,18 @@ class MinimalShellAgent:
                     "model_outcome_unknown", {"step": step, "request_id": request_id}
                 )
                 raise
+            except ModelError as error:
+                # An explicit provider rejection has a known outcome: no
+                # completion was accepted for this step. Preserve the patch and
+                # reconcile prior completed calls instead of converting their
+                # whole reservation into uncertain spend.
+                status = "model_error"
+                summary = f"Model request failed before a completion: {error}"
+                self.store.append_event(
+                    "model_error",
+                    {"step": step, "request_id": request_id, "error": str(error)},
+                )
+                break
 
             if completion.cost_usd is None:
                 cost_known = False
@@ -171,9 +183,19 @@ class MinimalShellAgent:
                 summary = action["summary"]
                 break
 
-            result = await self.sandbox.exec(
-                action["command"], timeout_sec=self.limits.command_timeout_sec
-            )
+            try:
+                result = await self.sandbox.exec(
+                    action["command"], timeout_sec=self.limits.command_timeout_sec
+                )
+            except TimeoutError as error:
+                # A slow repository command is an observation about the task, not
+                # an infrastructure failure. Let the model choose a narrower test,
+                # inspect the partial work, or finish within its remaining steps.
+                result = ExecResult(
+                    stdout="",
+                    stderr=str(error),
+                    return_code=124,
+                )
             self.store.append_event(
                 "shell_result",
                 {
@@ -213,8 +235,29 @@ def parse_action(content: str) -> dict[str, str]:
         candidate = fenced.group(1)
     try:
         value = json.loads(candidate)
-    except json.JSONDecodeError as error:
-        raise ValueError("response is not valid JSON") from error
+    except json.JSONDecodeError:
+        # Some models explain their next step and then emit one valid action.
+        # Accept exactly one embedded JSON action while rejecting ambiguous
+        # responses containing multiple action objects.
+        decoder = json.JSONDecoder()
+        embedded: list[object] = []
+        for index, character in enumerate(candidate):
+            if character != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(candidate[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("action") in (
+                "shell",
+                "finish",
+            ):
+                embedded.append(parsed)
+        if len(embedded) != 1:
+            raise ValueError(
+                "response must contain exactly one valid JSON action object"
+            )
+        value = embedded[0]
     if not isinstance(value, dict):
         raise ValueError("response must be a JSON object")
     action = value.get("action")
