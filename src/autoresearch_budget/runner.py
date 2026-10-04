@@ -24,6 +24,7 @@ class ModelProfile:
     model: str
     run_max_cost_usd: Decimal
     reasoning_effort: str | None
+    service_tier: str | None
     provider: dict[str, Any] | None
 
 
@@ -52,6 +53,7 @@ class ExperimentConfig:
                 model=value["model"],
                 run_max_cost_usd=Decimal(str(value["run_max_cost_usd"])),
                 reasoning_effort=value.get("reasoning_effort"),
+                service_tier=value.get("service_tier"),
                 provider=value.get("provider"),
             )
             for name, value in raw["profiles"].items()
@@ -264,6 +266,8 @@ class HarborTrialRunner:
         model_kwargs: dict[str, Any] = {
             "drop_params": True,
         }
+        if profile.service_tier:
+            model_kwargs["service_tier"] = profile.service_tier
         if profile.provider:
             model_kwargs["extra_body"] = {"provider": profile.provider}
         config = {
@@ -396,11 +400,20 @@ def _force_agent_network_policy(
 
 
 def _completed_job_cost(path: Path) -> Decimal | None:
-    """Read Harbor's aggregate cost only from a finished one-trial job."""
+    """Read billed OpenRouter cost from a finished one-trial Harbor job.
+
+    Newly released models can be absent from LiteLLM's local price table, making
+    Harbor's aggregate incorrectly report zero. The raw OpenRouter responses in
+    mini-SWE's trajectory include the billed cost and take precedence when every
+    recorded API call has one.
+    """
     try:
         result = json.loads(path.read_text(encoding="utf-8"))
         if not result.get("finished_at") or result.get("n_total_trials") != 1:
             return None
+        billed = _trajectory_billed_cost(path.parent)
+        if billed is not None:
+            return billed
         raw_cost = result["stats"]["cost_usd"]
         cost = Decimal(str(raw_cost))
         if not cost.is_finite() or cost < 0:
@@ -414,4 +427,28 @@ def _completed_job_cost(path: Path) -> Decimal | None:
         InvalidOperation,
         json.JSONDecodeError,
     ):
+        return None
+
+
+def _trajectory_billed_cost(job_dir: Path) -> Decimal | None:
+    trajectories = list(job_dir.glob("*/agent/mini-swe-agent.trajectory.json"))
+    if len(trajectories) != 1:
+        return None
+    try:
+        trajectory = json.loads(trajectories[0].read_text(encoding="utf-8"))
+        expected = int(trajectory["info"]["model_stats"]["api_calls"])
+        costs: list[Decimal] = []
+        for message in trajectory["messages"]:
+            response = message.get("extra", {}).get("response") or {}
+            usage = response.get("usage") or {}
+            if "cost" not in usage or usage["cost"] is None:
+                continue
+            cost = Decimal(str(usage["cost"]))
+            if not cost.is_finite() or cost < 0:
+                return None
+            costs.append(cost)
+        if expected < 1 or len(costs) != expected:
+            return None
+        return sum(costs, Decimal("0"))
+    except (OSError, KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError):
         return None

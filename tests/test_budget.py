@@ -11,6 +11,14 @@ from autoresearch_budget.budget import (
 
 
 class BudgetLedgerTest(unittest.TestCase):
+    def test_corrects_settled_cost_from_provider_billing(self):
+        with TemporaryDirectory() as temp:
+            ledger = BudgetLedger(Path(temp) / "budget.sqlite3", "1.00")
+            ledger.reserve("r1", run_id="run", model="model", max_cost_usd="0.50")
+            ledger.reconcile("r1", "0")
+            ledger.correct_settled("r1", "0.125", note="provider billing")
+            self.assertEqual(ledger.snapshot().settled_usd, Decimal("0.125000"))
+
     def test_reservations_hold_capacity_and_reconcile_actual_cost(self):
         with TemporaryDirectory() as temp:
             ledger = BudgetLedger(Path(temp) / "budget.sqlite3", "1.00")

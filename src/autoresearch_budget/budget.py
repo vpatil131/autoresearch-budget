@@ -207,6 +207,48 @@ class BudgetLedger:
                     connection.rollback()
                 raise
 
+    def correct_settled(
+        self,
+        reservation_id: str,
+        actual_cost_usd: Decimal | str | int | float,
+        *,
+        note: str,
+    ) -> None:
+        """Correct a settled amount after checking authoritative provider billing."""
+        actual = to_microusd(actual_cost_usd)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM reservations WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+                if row is None:
+                    raise ReservationError(f"unknown reservation {reservation_id!r}")
+                if row["status"] != "settled":
+                    raise ReservationError(
+                        f"reservation {reservation_id!r} is {row['status']}, not settled"
+                    )
+                exceeded = actual > int(row["reserved_microusd"])
+                connection.execute(
+                    """
+                    UPDATE reservations
+                    SET actual_microusd = ?, note = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE reservation_id = ?
+                    """,
+                    (actual, note, reservation_id),
+                )
+                connection.commit()
+                if exceeded:
+                    raise ReservationError(
+                        f"corrected cost ${from_microusd(actual)} exceeded reserved "
+                        f"amount ${from_microusd(row['reserved_microusd'])}"
+                    )
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+
     def mark_uncertain(self, reservation_id: str, note: str) -> None:
         self._transition(reservation_id, "uncertain", note)
 

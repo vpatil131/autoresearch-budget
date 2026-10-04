@@ -33,12 +33,14 @@ class OpenRouterClientTest(unittest.TestCase):
                     "completion_tokens_details": {"reasoning_tokens": 5},
                 },
                 "openrouter_metadata": {"provider_name": "example-provider"},
+                "service_tier": "flex",
             }
             return 200, json.dumps(response).encode()
 
         client = OpenRouterClient(
             api_key="secret-value",
             model="qwen/qwen3.6-35b-a3b",
+            service_tier="flex",
             provider={"allow_fallbacks": False},
             allow_paid=True,
             transport=transport,
@@ -54,6 +56,8 @@ class OpenRouterClientTest(unittest.TestCase):
         self.assertEqual(completion.cached_tokens, 40)
         self.assertEqual(completion.reasoning_tokens, 5)
         self.assertEqual(captured["body"]["max_completion_tokens"], 1000)
+        self.assertEqual(captured["body"]["service_tier"], "flex")
+        self.assertEqual(completion.provider_metadata["service_tier"], "flex")
         self.assertEqual(captured["authorization"], "Bearer secret-value")
 
     def test_paid_client_requires_explicit_enablement(self):

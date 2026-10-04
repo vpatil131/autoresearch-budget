@@ -1,5 +1,6 @@
 import json
 import os
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -35,6 +36,7 @@ class HarborTrialRunnerTest(unittest.TestCase):
                 "small": {
                     "model": "qwen/example",
                     "run_max_cost_usd": "0.25",
+                    "service_tier": "flex",
                     "provider": {"allow_fallbacks": False},
                 }
             },
@@ -81,6 +83,7 @@ class HarborTrialRunnerTest(unittest.TestCase):
             self.assertIn("max_tokens=1000", rendered)
             self.assertIn('"step_limit":5', rendered)
             self.assertIn('"provider":{"allow_fallbacks":false}', rendered)
+            self.assertIn('"service_tier":"flex"', rendered)
             self.assertIn('"OPENROUTER_API_KEY":""', rendered)
             self.assertNotIn("test-key", rendered)
 
@@ -192,6 +195,26 @@ class HarborTrialRunnerTest(unittest.TestCase):
                 )
             )
             self.assertIsNone(_completed_job_cost(path))
+
+    def test_completed_job_cost_prefers_openrouter_trajectory_billing(self):
+        with TemporaryDirectory() as temp:
+            job = Path(temp)
+            path = job / "result.json"
+            path.write_text(json.dumps({
+                "finished_at": "2026-10-04T00:00:00Z",
+                "n_total_trials": 1,
+                "stats": {"cost_usd": 0},
+            }))
+            agent = job / "trial" / "agent"
+            agent.mkdir(parents=True)
+            (agent / "mini-swe-agent.trajectory.json").write_text(json.dumps({
+                "info": {"model_stats": {"api_calls": 2}},
+                "messages": [
+                    {"extra": {"response": {"usage": {"cost": 0.01}}}},
+                    {"extra": {"response": {"usage": {"cost": 0.02}}}},
+                ],
+            }))
+            self.assertEqual(_completed_job_cost(path), Decimal("0.03"))
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ async def run_probe(
                 if profile.reasoning_effort
                 else None
             ),
+            service_tier=profile.service_tier,
             provider=profile.provider,
             allow_paid=True,
         )
@@ -94,6 +95,7 @@ async def run_probe(
             "max_cost_usd": max_cost_usd,
             "max_tokens": max_tokens,
             "reasoning_effort": profile.reasoning_effort,
+            "service_tier": profile.service_tier,
             "provider": profile.provider,
         }
     )
@@ -168,4 +170,3 @@ async def run_probe(
     )
     store.write_summary(asdict(result))
     return result
-

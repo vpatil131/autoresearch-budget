@@ -68,6 +68,7 @@ class OpenRouterClient:
         api_key: str,
         model: str,
         reasoning: dict[str, Any] | None = None,
+        service_tier: str | None = None,
         provider: dict[str, Any] | None = None,
         allow_paid: bool = False,
         endpoint: str = "https://openrouter.ai/api/v1/chat/completions",
@@ -82,6 +83,7 @@ class OpenRouterClient:
         self.api_key = api_key
         self.model = model
         self.reasoning = reasoning
+        self.service_tier = service_tier
         self.provider = provider
         self.endpoint = endpoint
         self.timeout_sec = timeout_sec
@@ -106,6 +108,8 @@ class OpenRouterClient:
         }
         if self.reasoning:
             body["reasoning"] = self.reasoning
+        if self.service_tier:
+            body["service_tier"] = self.service_tier
         if self.provider:
             body["provider"] = self.provider
         request = urllib.request.Request(
@@ -167,7 +171,10 @@ class OpenRouterClient:
             cached_tokens=int(prompt_details.get("cached_tokens") or 0),
             reasoning_tokens=int(completion_details.get("reasoning_tokens") or 0),
             finish_reason=choice.get("finish_reason"),
-            provider_metadata=response.get("openrouter_metadata") or {},
+            provider_metadata={
+                **(response.get("openrouter_metadata") or {}),
+                "service_tier": response.get("service_tier"),
+            },
             raw_usage=usage,
         )
 
