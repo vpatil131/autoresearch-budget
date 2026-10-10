@@ -188,10 +188,11 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertEqual(body['model'],'deepseek/mock')
         self.assertEqual(body['provider']['only'],['DeepInfra'])
         self.assertEqual(body['reasoning'],{'effort':'medium'})
-        self.assertEqual(body['max_completion_tokens'],512)
+        self.assertEqual(body['max_tokens'],512)
         self.assertEqual(body['tool_choice'],'required')
         self.assertEqual({tool['function']['name'] for tool in body['tools']},{'execute','submit'})
         self.assertNotIn('drop_params',body)
+        self.assertNotIn('parallel_tool_calls',body)
         self.assertEqual(message['extra']['actions'][0]['name'],'execute')
 
     def test_full_output_is_retained_and_shell_sentinel_does_not_submit(self):

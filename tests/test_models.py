@@ -55,7 +55,7 @@ class OpenRouterClientTest(unittest.TestCase):
         self.assertEqual(completion.cost_usd, Decimal("0.012345"))
         self.assertEqual(completion.cached_tokens, 40)
         self.assertEqual(completion.reasoning_tokens, 5)
-        self.assertEqual(captured["body"]["max_completion_tokens"], 1000)
+        self.assertEqual(captured["body"]["max_tokens"], 1000)
         self.assertEqual(captured["body"]["service_tier"], "flex")
         self.assertEqual(completion.provider_metadata["service_tier"], "flex")
         self.assertEqual(captured["authorization"], "Bearer secret-value")

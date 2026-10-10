@@ -114,7 +114,7 @@ class OpenRouterClient:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_completion_tokens": max_tokens,
+            "max_tokens": max_tokens,
             "stream": False,
             "metadata": {"experiment_request_id": request_id},
         }

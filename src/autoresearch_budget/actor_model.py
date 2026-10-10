@@ -50,7 +50,7 @@ class StructuredActorModel(OpenRouterModel):
                 model=self.config.model_name.removeprefix("openrouter/"),
                 provider=provider, reasoning=reasoning or ({"effort": effort} if effort else None),
                 service_tier=options.pop("service_tier", None), timeout_sec=timeout,
-                tools=actor_tools(), body_options={**extra, **options, "tool_choice": "required", "parallel_tool_calls": False},
+                tools=actor_tools(), body_options={**extra, **options, "tool_choice": "required"},
                 recorder=self._record, allow_paid=True,
             )
             self.max_tokens = max_tokens
