@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -11,7 +12,9 @@ from typing import Any, Callable, Protocol
 
 
 class ModelError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, response: dict | None = None):
+        super().__init__(message)
+        self.response = response or {}
 
 
 class RequestOutcomeUnknown(ModelError):
@@ -32,6 +35,7 @@ class Completion:
     finish_reason: str | None = None
     provider_metadata: dict[str, Any] = field(default_factory=dict)
     raw_usage: dict[str, Any] = field(default_factory=dict)
+    raw_response: dict[str, Any] = field(default_factory=dict)
 
 
 class CompletionBackend(Protocol):
@@ -75,6 +79,9 @@ class OpenRouterClient:
         timeout_sec: float = 180.0,
         transport: Transport = _default_transport,
         retry_delays_sec: tuple[float, ...] = (2.0, 4.0, 8.0),
+        tools: list[dict] | None = None,
+        body_options: dict[str, Any] | None = None,
+        recorder: Callable[[str, dict], Any] | None = None,
     ):
         if not allow_paid:
             raise ValueError("paid inference is disabled; pass allow_paid=True explicitly")
@@ -89,6 +96,11 @@ class OpenRouterClient:
         self.timeout_sec = timeout_sec
         self.transport = transport
         self.retry_delays_sec = retry_delays_sec
+        self.tools = tools
+        self.body_options = body_options or {}
+        if set(self.body_options) & {"model", "messages", "metadata", "stream", "tools"}:
+            raise ValueError("body_options cannot override the model request contract")
+        self.recorder = recorder
 
     async def complete(
         self,
@@ -112,6 +124,9 @@ class OpenRouterClient:
             body["service_tier"] = self.service_tier
         if self.provider:
             body["provider"] = self.provider
+        body.update(self.body_options)
+        if self.tools:
+            body["tools"] = self.tools
         request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(body).encode("utf-8"),
@@ -124,9 +139,25 @@ class OpenRouterClient:
             method="POST",
         )
         for attempt in range(len(self.retry_delays_sec) + 1):
-            status, raw = await asyncio.to_thread(
-                self.transport, request, self.timeout_sec
-            )
+            fields = {"request_id": request_id, "transport_attempt": attempt + 1}
+            started = time.monotonic()
+            if self.recorder:
+                self.recorder("model_request", {**fields, "endpoint": self.endpoint,
+                    "method": "POST", "headers": {
+                        key: "[REDACTED]" if key.lower() == "authorization" else value
+                        for key, value in request.header_items()
+                    }, "body": body})
+            try:
+                status, raw = await asyncio.to_thread(self.transport, request, self.timeout_sec)
+            except Exception as error:
+                if self.recorder:
+                    self.recorder("model_transport_error", {**fields, "duration_seconds": time.monotonic() - started,
+                        "error": str(error), "outcome_unknown": True})
+                raise
+            if self.recorder:
+                self.recorder("model_response", {**fields, "status": status,
+                    "duration_seconds": time.monotonic() - started,
+                    "raw_body": raw.decode("utf-8", errors="replace")})
             try:
                 response = json.loads(raw)
             except json.JSONDecodeError as error:
@@ -135,17 +166,19 @@ class OpenRouterClient:
                 ) from error
             if status != 429 or attempt == len(self.retry_delays_sec):
                 break
+            if self.recorder:
+                self.recorder("model_retry", {**fields, "delay_seconds": self.retry_delays_sec[attempt], "reason": "HTTP 429"})
             await asyncio.sleep(self.retry_delays_sec[attempt])
         if status < 200 or status >= 300:
-            raise ModelError(f"OpenRouter HTTP {status}: {_error_message(response)}")
+            raise ModelError(f"OpenRouter HTTP {status}: {_error_message(response)}", response=response)
         if response.get("error"):
-            raise ModelError(f"OpenRouter error: {_error_message(response)}")
+            raise ModelError(f"OpenRouter error: {_error_message(response)}", response=response)
         choices = response.get("choices") or []
         if not choices:
-            raise ModelError("OpenRouter response contained no choices")
+            raise ModelError("OpenRouter response contained no choices", response=response)
         choice = choices[0]
         if choice.get("error") or choice.get("finish_reason") == "error":
-            raise ModelError(f"OpenRouter generation error: {_error_message(choice)}")
+            raise ModelError(f"OpenRouter generation error: {_error_message(choice)}", response=response)
         message = choice.get("message") or {}
         content = message.get("content")
         # Reasoning models can consume their entire output allowance before
@@ -155,7 +188,7 @@ class OpenRouterClient:
         if content is None:
             content = ""
         elif not isinstance(content, str):
-            raise ModelError("OpenRouter response contained no text content")
+            raise ModelError("OpenRouter response contained no text content", response=response)
         usage = response.get("usage") or {}
         prompt_details = usage.get("prompt_tokens_details") or {}
         completion_details = usage.get("completion_tokens_details") or {}
@@ -176,6 +209,7 @@ class OpenRouterClient:
                 "service_tier": response.get("service_tier"),
             },
             raw_usage=usage,
+            raw_response=response,
         )
 
 

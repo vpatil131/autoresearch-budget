@@ -174,6 +174,75 @@ class HarborTrialRunnerTest(unittest.TestCase):
             self.assertEqual(str(snapshot.held_usd), "0.000000")
             self.assertEqual((task / "task.toml").read_text(), original)
 
+    def _poc_config(self, root, *, paid=False):
+        config=self._config(root,paid=paid,scaffold="mini-swe-advisor")
+        raw=json.loads(config.path.read_text())
+        raw["budget"]["enforce"]=False
+        raw["agent"]["max_steps"]=80
+        raw["profiles"]["frontier"]={"model":"openai/mock-advisor","run_max_cost_usd":"2.00",
+            "reasoning_effort":"medium","service_tier":"flex","provider":{"only":["OpenAI"],"allow_fallbacks":False}}
+        raw["consultation"]={"policy":"fixed_interval","every_steps":10,"max_calls":100,
+            "advisor_profile":"frontier","task_manifest":"sample.json"}
+        (root/"sample.json").write_text(json.dumps({"tasks":[{"task_id":"owner__repo-1"}]}))
+        config.path.write_text(json.dumps(raw))
+        return ExperimentConfig.load(config.path,project_root=root)
+
+    def test_poc_plan_pins_structured_classes_interval_and_run_identity(self):
+        with TemporaryDirectory() as temp:
+            config=self._poc_config(Path(temp))
+            runner=HarborTrialRunner(config)
+            command=runner.command(TrialSpec("owner__repo-1","small"))
+            value=json.loads(next(arg[7:] for arg in command if arg.startswith("config=")))
+            self.assertEqual(value["agent"]["step_limit"],80)
+            self.assertEqual(value["agent"]["advice"]["every_steps"],10)
+            self.assertEqual(value["agent"]["advice"]["max_calls"],100)
+            self.assertEqual(value["agent"]["advice"]["advisor"]["reasoning_effort"],"medium")
+            self.assertEqual(value["agent"]["advice"]["run_id"],command[command.index("--job-name")+1])
+            self.assertIn("StructuredActorModel",value["model"]["model_class"])
+            self.assertIn("PocEnvironment",value["environment"]["environment_class"])
+            self.assertIn("cost_limit=0",command)
+            with self.assertRaises(RunnerConfigError):
+                runner.command(TrialSpec("outside-sample","small"))
+            with self.assertRaises(RunnerConfigError):
+                runner.run(TrialSpec("owner__repo-1","small"))
+
+    def test_poc_retains_grading_after_run_without_budget_ledger_or_overwrites(self):
+        with TemporaryDirectory() as temp:
+            root=Path(temp); config=self._poc_config(root,paid=True)
+            task=root/"tasks"/"owner__repo-1"; task.mkdir(parents=True)
+            (task/"task.toml").write_text('[agent]\ntimeout_sec=300\n[environment]\nnetwork_mode="public"\n')
+            (task/"instruction.md").write_text('Fix the public issue')
+            (root/".env").write_text('OPENROUTER_API_KEY=offline-secret\n')
+            runner=HarborTrialRunner(config)
+            spec=TrialSpec("owner__repo-1","small")
+            job=runner._job_name(spec)
+            def completed(command,**kwargs):
+                self.assertIn('offline-secret',kwargs['env']['OPENROUTER_API_KEY'])
+                kwargs['stdout'].write('redact offline-secret\n')
+                agent=config.jobs_root/job/'trial'/'agent'; agent.mkdir(parents=True)
+                (agent/'mini-swe-agent.trajectory.json').write_text(json.dumps({'info':{'poc_metrics':{'total_cost_usd':'0.10','run_id':job}}}))
+                verifier=agent.parent/'verifier'; verifier.mkdir()
+                (verifier/'reward.txt').write_text('1.0')
+                (verifier/'output.log').write_text('Keep evidence; redact offline-secret')
+                (agent.parent/'result.json').write_text(json.dumps({'verifier_result':{'rewards':{'reward':1.0}}}))
+                (config.jobs_root/job/'result.json').write_text(json.dumps({'finished_at':'now'}))
+                return Mock(returncode=0)
+            with patch('subprocess.run',side_effect=completed), patch('autoresearch_budget.runner.BudgetLedger',side_effect=AssertionError('No dollar enforcement')):
+                self.assertEqual(runner.run(spec),0)
+            records=config.jobs_root/'_poc_records'/job
+            metadata=json.loads((records/'metadata.json').read_text())
+            self.assertFalse(metadata['configuration']['budget']['enforce'])
+            self.assertNotIn('offline-secret',(records/'harbor-console.log').read_text())
+            self.assertEqual((records/'post_submission'/'trial'/'verifier'/'reward.txt').read_text(),'1.0')
+            self.assertNotIn('offline-secret',(records/'post_submission'/'trial'/'verifier'/'output.log').read_text())
+            events=[json.loads(line) for line in (records/'events.jsonl').read_text().splitlines()]
+            self.assertTrue(any(e['kind']=='post_submission_verifier' and e['payload']['track']=='post_submission' for e in events))
+            self.assertEqual(json.loads((records/'summary.json').read_text())['status'],'completed')
+            with patch('subprocess.run',side_effect=AssertionError('Must preserve first run')):
+                with self.assertRaises(RunnerConfigError):
+                    runner.run(spec)
+            self.assertNotEqual(runner._job_name(spec),runner._job_name(TrialSpec("owner__repo-1","small",2)))
+
     def test_completed_job_cost_rejects_unfinished_result(self):
         with TemporaryDirectory() as temp:
             path = Path(temp) / "result.json"

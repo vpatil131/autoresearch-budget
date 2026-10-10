@@ -1,0 +1,55 @@
+{
+  "budget": {
+    "ledger": "runs/budget.sqlite3",
+    "cap_usd": "15.00",
+    "enforce": false
+  },
+  "locations": {
+    "task_root": "data/harbor/swe-rebench-07-2026",
+    "jobs_root": "runs/phase1-trials"
+  },
+  "agent": {
+    "scaffold": "mini-swe-advisor",
+    "version": "2.4.6",
+    "max_steps": 80,
+    "max_tokens_per_call": 4096,
+    "command_timeout_sec": 120,
+    "max_observation_chars": 20000
+  },
+  "profiles": {
+    "small": {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "run_max_cost_usd": "0.75",
+      "provider": {
+        "only": [
+          "DeepInfra"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      }
+    },
+    "frontier": {
+      "model": "openai/gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "service_tier": "flex",
+      "run_max_cost_usd": "2.00",
+      "provider": {
+        "only": [
+          "OpenAI"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      }
+    }
+  },
+  "paid_inference_enabled": false,
+  "consultation": {
+    "policy": "fixed_interval",
+    "every_steps": 10,
+    "max_calls": 100,
+    "max_context_chars": 60000,
+    "max_output_tokens": 4096,
+    "advisor_profile": "frontier",
+    "task_manifest": "config/sample-24-v2.json"
+  }
+}

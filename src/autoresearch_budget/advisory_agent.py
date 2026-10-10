@@ -1,0 +1,268 @@
+"""mini-SWE 2.4.6 controller for the fixed-interval advisor proof of concept."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shlex
+import time
+from decimal import Decimal
+from pathlib import Path
+from uuid import uuid4
+
+from minisweagent.agents.default import DefaultAgent
+from minisweagent.exceptions import FormatError, Submitted
+
+from .advisor import AdvicePolicy, Advisor, SCHEDULED_QUESTION, actor_usage, advice_packet, amount
+from .contracts import ACTOR_INSTANCE, ACTOR_SYSTEM, CONTRACT_VERSION, validate_action, validate_guidance
+from .models import ModelError, RequestOutcomeUnknown
+from .store import RunStore
+
+# Include new, untracked files as well as tracked/staged changes. Git binary patches
+# preserve candidate contents; no hidden verifier files are queried by the controller.
+PATCH_COMMAND = "bash -c " + shlex.quote("""set -o pipefail
+git diff --no-ext-diff --no-color --binary HEAD &&
+git ls-files --others --exclude-standard -z | while IFS= read -r -d '' file; do
+  git diff --no-ext-diff --no-color --binary --no-index -- /dev/null "$file"
+  rc=$?; if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+done""")
+
+
+class AdvisoryAgent(DefaultAgent):
+    def __init__(self, model, env, *, advice: dict, advisor=None, max_observation_chars=20000, **kwargs):
+        self.policy = AdvicePolicy.load(advice)
+        self.advisor_profile = dict(advice.get("advisor", {}))
+        self.advisor = advisor
+        if not isinstance(max_observation_chars, int) or max_observation_chars < 100:
+            raise ValueError("max_observation_chars must be at least 100")
+        self.max_observation_chars = max_observation_chars
+        # The builtin mini prompt assumes bash and a shell submission sentinel.
+        # Replace both prompt templates so they agree with the native tools.
+        kwargs["system_template"] = ACTOR_SYSTEM.replace("every 10", f"every {self.policy.every_steps}")
+        kwargs["instance_template"] = ACTOR_INSTANCE
+        super().__init__(model, env, **kwargs)
+        if self.config.cost_limit != 0:
+            raise ValueError("The advisory POC requires cost_limit=0; dollar enforcement is deferred")
+        output_dir = self.config.output_path.parent if self.config.output_path else Path(".")
+        secrets = tuple(value for key, value in os.environ.items()
+                        if any(word in key.upper() for word in ("API_KEY", "TOKEN", "PASSWORD", "OPENROUTER_KEY")))
+        self.advice_store = RunStore(output_dir / "advice", run_id=advice.get("run_id") or str(uuid4()), secrets=secrets)
+        self.last_checkpoint = -1
+        self.advisor_calls = self.advisor_failures = self.unknown_advisor_costs = 0
+        self.advisor_cost = Decimal("0")
+        self.advisor_prompt_tokens = self.advisor_completion_tokens = 0
+        self.pending_advice = None
+        self.state = {}
+        self.observation_ids: set[str] = set()
+        self.patch_id = None
+        self.patch_text = ""
+        self.patch_hash = None
+        self.patch_number = 0
+        self.finished = False
+        self.started = time.monotonic()
+        if hasattr(model, "bind"):
+            model.bind(self.advice_store)
+        if hasattr(env, "bind"):
+            env.bind(self.advice_store, lambda: self.n_calls)
+        self.advice_store.write_metadata({
+            "contract_version": CONTRACT_VERSION, "policy": self.policy.__dict__,
+            "advisor": self.advisor_profile, "budget_enforced": False,
+            "hidden_verifier_feedback": False, "agent_config": self.config.model_dump(mode="json"),
+            "model_config": model.serialize(), "environment_config": env.serialize(),
+            "max_observation_chars": max_observation_chars,
+        })
+
+    def add_messages(self, *messages):
+        for message in messages:
+            self.advice_store.append_event("model_visible_message", {"actor_call": self.n_calls, "message": message})
+        return super().add_messages(*messages)
+
+    def handle_uncaught_exception(self, error):
+        messages = super().handle_uncaught_exception(error)
+        if isinstance(error, ModelError) and error.response:
+            # Failed provider generations may still return billed usage.
+            messages[0]["extra"]["response"] = error.response
+            self.advice_store.append_event("actor_failed_usage", {"actor_call": self.n_calls,
+                "response": error.response})
+        return messages
+
+    def run(self, task="", **kwargs):
+        if self.n_calls or self.finished:
+            raise ValueError("Create a new controller for each attempt")
+        self.advice_store.append_event("run_started", {"actor_call": 0, "issue": task})
+        identity = self.env.execute({"command": "git rev-parse --show-toplevel && git rev-parse HEAD && git status --porcelain=v1", "source": "controller"})
+        self.advice_store.append_event("repository_identity", {"actor_call": 0, "result": identity})
+        self._snapshot("initial")
+        try:
+            return super().run(task, **kwargs)
+        finally:
+            self._snapshot("final")
+            self.advice_store.append_event("run_finished", {"actor_call": self.n_calls,
+                "patch_id": self.patch_id, "duration_seconds": time.monotonic() - self.started,
+                "stop_reason": self.messages[-1].get("extra", {}).get("exit_status") if self.messages else "error"})
+            self.finished = True
+            self.save(self.config.output_path)
+
+    def query(self):
+        capacity = self.config.step_limit == 0 or self.n_calls < self.config.step_limit
+        time_remaining = self.config.wall_time_limit_seconds == 0 or time.time() - self._start_time < self.config.wall_time_limit_seconds
+        if capacity and time_remaining and self.policy.scheduled(self.n_calls, self.config.step_limit, self.last_checkpoint):
+            self.last_checkpoint = self.n_calls
+            guidance = self._consult()
+            self.add_messages(self.model.format_message(role="user", content=guidance,
+                              extra={"advice_id": self.pending_advice} if self.pending_advice else {}))
+        # DefaultAgent owns call counting and billing, including format-error calls.
+        self.model.actor_call = self.n_calls + 1
+        self.model.pending_advice = self.pending_advice
+        self.model.observation_ids = self.observation_ids
+        return super().query()
+
+    def execute_actions(self, message):
+        actions = message.get("extra", {}).get("actions", [])
+        try:
+            if len(actions) != 1:
+                raise ValueError("Exactly one native action is required")
+            action = actions[0]
+            validate_action(action["name"], {key: value for key, value in action.items() if key not in {"name", "tool_call_id"}})
+            decision = action.get("advice_decision")
+            if self.pending_advice and (not decision or decision["advice_id"] != self.pending_advice):
+                raise ValueError(f"advice_decision for {self.pending_advice} is required")
+            if not self.pending_advice and decision:
+                raise ValueError("No advisor guidance is awaiting a decision")
+            if action["name"] == "submit" and set(action["validation_refs"]) - self.observation_ids:
+                raise ValueError("Unknown validation reference")
+        except (ValueError, KeyError, TypeError) as error:
+            self.advice_store.append_event("actor_schema_error", {"actor_call": self.n_calls, "error": str(error)})
+            # A parsed assistant tool call is already in the transcript; close it
+            # with a tool error rather than leaving an unmatched call in context.
+            corrections = self.model.format_observation_messages(message,
+                [{"output": f"Schema error: {error}", "returncode": -1, "exception_info": "schema_validation"}])
+            raise FormatError(*corrections) from error
+        self.state.update(action["state"])
+        self.advice_store.append_event("actor_action", {"actor_call": self.n_calls,
+            "action": action, "state": self.state, "patch_id": self.patch_id})
+        if decision:
+            self.advice_store.append_event("advice_decision", {"actor_call": self.n_calls, **decision})
+            self.pending_advice = None
+        if action["name"] == "submit":
+            self.advice_store.append_event("submission", {"actor_call": self.n_calls,
+                "summary": action["summary"], "validation_refs": action["validation_refs"], "patch_id": self.patch_id})
+            raise Submitted({"role": "exit", "content": action["summary"],
+                             "extra": {"exit_status": "Submitted", "submission": action["summary"]}})
+        observation_id = f"observation-{self.n_calls}"
+        output = self.env.execute({"command": action["command"], "observation_id": observation_id})
+        # The environment records the complete combined stdout/stderr and return code.
+        self.advice_store.append_event("raw_observation", {"actor_call": self.n_calls,
+            "observation_id": observation_id, "result": output})
+        visible = dict(output)
+        text = str(output.get("output", ""))
+        if len(text) > self.max_observation_chars:
+            half = (self.max_observation_chars - 80) // 2
+            visible["output"] = text[:half] + f"\n[... {len(text) - 2 * half} chars omitted; full output retained ...]\n" + text[-half:]
+        self._snapshot("after_action")
+        self.observation_ids.add(observation_id)
+        visible["extra"] = {"observation_id": observation_id, "patch_id": self.patch_id,
+                            "output_truncated": len(text) > self.max_observation_chars}
+        visible = self.advice_store.redact(visible)
+        observations = self.model.format_observation_messages(message, [visible], self.get_template_vars())
+        # Advertise the evidence ID without changing the saved raw command output.
+        for observation in observations:
+            observation["content"] = f"[{observation_id}; {self.patch_id}]\n" + observation["content"]
+        self.advice_store.append_event("visible_observation", {"actor_call": self.n_calls,
+            "observation_id": observation_id, "patch_id": self.patch_id, "messages": observations})
+        return self.add_messages(*observations)
+
+    def _snapshot(self, reason):
+        result = self.env.execute({"command": PATCH_COMMAND, "source": "controller"})
+        text = str(result.get("output", ""))
+        if result.get("returncode") != 0:
+            self.advice_store.append_event("patch_snapshot_failed", {"actor_call": self.n_calls, "reason": reason, "result": result})
+            return
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        if digest != self.patch_hash or reason == "final":
+            self.patch_number += 1
+            self.patch_id = f"patch-{self.patch_number}"
+            self.patch_text, self.patch_hash = text, digest
+            artifact = self.advice_store.write_artifact(self.patch_id, {"patch": text, "sha256": digest})
+            self.advice_store.append_event("patch_snapshot", {"actor_call": self.n_calls,
+                "patch_id": self.patch_id, "reason": reason, "artifact": artifact, "sha256": digest})
+
+    def _advisor_record(self, kind, payload):
+        self.advice_store.append_event(kind, {"model_role": "advisor", "actor_call": self.n_calls, **payload})
+
+    def _consult(self):
+        if self.advisor_calls >= self.policy.max_calls:
+            self.advice_store.append_event("advice_denied", {"actor_call": self.n_calls, "reason": "call_limit"})
+            return "Advisor call ceiling reached. Continue independently."
+        packet = advice_packet(task=self.extra_template_vars.get("task", ""), messages=self.messages,
+            diff=self.patch_text, question=SCHEDULED_QUESTION, actor_calls=self.n_calls,
+            actor_limit=self.config.step_limit, max_chars=self.policy.max_context_chars,
+            state=self.state, patch_id=self.patch_id)
+        packet = self.advice_store.redact(packet)
+        self.advisor_calls += 1
+        advice_id = f"advice-{self.advisor_calls}"
+        request_id = f"{self.advice_store.run_id}:{advice_id}"
+        self.advice_store.append_event("advice_requested", {"actor_call": self.n_calls,
+            "advice_id": advice_id, "request_id": request_id, "packet": packet})
+        started = time.monotonic()
+        try:
+            if self.advisor is None:
+                self.advisor = Advisor.from_profile(self.advisor_profile,
+                    os.environ.get("OPENROUTER_API_KEY") or os.environ.get("MSWEA_API_KEY", ""),
+                    self.policy.max_output_tokens, self._advisor_record)
+            completion = self.advisor.consult(packet, request_id)
+        except (ModelError, ValueError) as error:
+            self.advisor_failures += 1
+            response = error.response if isinstance(error, ModelError) else {}
+            usage = response.get("usage") or {}
+            cost = amount(usage.get("cost"))
+            if cost is None:
+                self.unknown_advisor_costs += 1
+            else:
+                self.advisor_cost += cost
+            self.advisor_prompt_tokens += int(usage.get("prompt_tokens") or 0)
+            self.advisor_completion_tokens += int(usage.get("completion_tokens") or 0)
+            self.advice_store.append_event("advice_failed", {"actor_call": self.n_calls,
+                "advice_id": advice_id, "request_id": request_id, "error": str(error),
+                "outcome_unknown": isinstance(error, RequestOutcomeUnknown), "cost_usd": cost,
+                "response": response,
+                "duration_seconds": time.monotonic() - started})
+            return "Advisor request failed. Continue independently using public evidence."
+        cost = amount(completion.cost_usd)
+        if cost is None:
+            self.unknown_advisor_costs += 1
+        else:
+            self.advisor_cost += cost
+        self.advisor_prompt_tokens += completion.prompt_tokens
+        self.advisor_completion_tokens += completion.completion_tokens
+        self.advice_store.append_event("advice_received", {"actor_call": self.n_calls,
+            "advice_id": advice_id, "request_id": request_id, "completion": completion,
+            "duration_seconds": time.monotonic() - started})
+        try:
+            guidance = validate_guidance(completion.content)
+        except (ValueError, TypeError) as error:
+            self.advisor_failures += 1
+            self.advice_store.append_event("advice_schema_error", {"actor_call": self.n_calls,
+                "advice_id": advice_id, "error": str(error)})
+            return "Advisor returned malformed or empty guidance. Continue independently."
+        self.pending_advice = advice_id
+        self.advice_store.append_event("advice_delivered", {"actor_call": self.n_calls,
+            "advice_id": advice_id, "guidance": guidance})
+        return f"Advisor guidance ({advice_id}):\n{json.dumps(guidance)}\nInclude advice_decision for {advice_id} in your next action."
+
+    def serialize(self, *extra_dicts):
+        data = super().serialize(*extra_dicts)
+        actor = actor_usage(self.messages, self.n_calls)
+        advisor = {"api_calls": self.advisor_calls, "failures": self.advisor_failures,
+            "unknown_cost_calls": self.unknown_advisor_costs, "observed_cost_usd": str(self.advisor_cost),
+            "cost_usd": str(self.advisor_cost) if not self.unknown_advisor_costs else None,
+            "prompt_tokens": self.advisor_prompt_tokens, "completion_tokens": self.advisor_completion_tokens}
+        total = str(Decimal(actor["cost_usd"]) + Decimal(advisor["cost_usd"])) if actor["cost_usd"] is not None and advisor["cost_usd"] is not None else None
+        metrics = {"run_id": self.advice_store.run_id, "policy": self.policy.policy,
+            "every_steps": self.policy.every_steps, "budget_enforced": False,
+            "actor": actor, "advisor": advisor, "total_cost_usd": total,
+            "stop_reason": data["info"].get("exit_status"), "final_patch_id": self.patch_id,
+            "duration_seconds": time.monotonic() - self.started}
+        data["info"]["poc_metrics"] = metrics
+        self.advice_store.write_summary(metrics)
+        return self.advice_store.redact(data)
