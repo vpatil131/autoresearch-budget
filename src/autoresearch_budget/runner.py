@@ -153,7 +153,8 @@ class HarborTrialRunner:
         )
         return command
 
-    def run(self, spec: TrialSpec, *, env_file: str | Path = ".env") -> int:
+    def run(self, spec: TrialSpec, *, env_file: str | Path = ".env",
+            source_root: Path | None = None) -> int:
         if not self.config.paid_inference_enabled:
             raise RunnerConfigError(
                 "paid inference is disabled in the experiment config"
@@ -179,7 +180,7 @@ class HarborTrialRunner:
             )
         environment["OPENROUTER_API_KEY"] = api_key
         existing_pythonpath = environment.get("PYTHONPATH")
-        source_path = str(self.config.project_root / "src")
+        source_path = str(source_root or self.config.project_root / "src")
         environment["PYTHONPATH"] = (
             source_path + os.pathsep + existing_pythonpath
             if existing_pythonpath

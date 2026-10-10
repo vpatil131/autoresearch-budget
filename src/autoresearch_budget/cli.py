@@ -17,6 +17,7 @@ from .models import ScriptedModel
 from .probe import run_probe
 from .runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, TrialSpec
 from .store import RunStore
+from .batch import BatchRunner
 
 
 class _MockSandbox:
@@ -80,11 +81,44 @@ def _parser() -> argparse.ArgumentParser:
     probe.add_argument("--profile", required=True)
     probe.add_argument("--max-cost-usd", type=Decimal, required=True)
     probe.add_argument("--max-tokens", type=int, default=128)
+    batch = commands.add_parser("batch", help="preview or execute the phase 1 task cohort")
+    batch_commands = batch.add_subparsers(dest="batch_command", required=True)
+    for name in ("plan", "run"):
+        command = batch_commands.add_parser(name)
+        command.add_argument("--config", type=Path, required=True)
+        command.add_argument("--batch-dir", type=Path, required=True)
+        command.add_argument("--profile", default="small")
+        command.add_argument("--concurrency", type=int, default=4)
+        command.add_argument("--env-file", default=".env")
+    status = batch_commands.add_parser("status", help="read progress for every active task")
+    status.add_argument("--batch-dir", type=Path, required=True)
+    status.add_argument("--live", action="store_true", help="also read live advice logs via Docker")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "batch":
+        try:
+            if args.batch_command == "status":
+                from .batch_monitor import snapshot
+                print(json.dumps(snapshot(args.batch_dir, live=args.live), indent=2))
+                return 0
+            config = ExperimentConfig.load(args.config, project_root=Path.cwd())
+            runner = BatchRunner(config, args.batch_dir, profile=args.profile,
+                                 concurrency=args.concurrency, env_file=args.env_file)
+            if args.batch_command == "plan":
+                preview = runner.plan()
+                preview["attempts"] = [{key: record.get(key) for key in
+                                       ("task_id", "attempt", "job_name", "return_code")}
+                                      for record in preview.pop("records")]
+                print(json.dumps(preview, indent=2))
+                return 0
+            return runner.run()
+        except (RunnerConfigError, OSError, ValueError, KeyError) as error:
+            # Parser/configuration failures must not accidentally launch paid work.
+            print(f"error: {error}")
+            return 2
     if args.command == "budget":
         ledger = BudgetLedger(args.db, args.cap_usd)
         print(json.dumps(asdict(ledger.snapshot()), default=str, indent=2))
