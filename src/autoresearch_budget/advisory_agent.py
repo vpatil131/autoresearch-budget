@@ -13,8 +13,8 @@ from uuid import uuid4
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.exceptions import FormatError, Submitted
 
-from .advisor import AdvicePolicy, Advisor, SCHEDULED_QUESTION, actor_usage, advice_packet, amount
-from .contracts import ACTOR_INSTANCE, ACTOR_SYSTEM, CONTRACT_VERSION, validate_action, validate_guidance
+from .advisor import AdvicePolicy, Advisor, AdvisorUnavailable, SCHEDULED_QUESTION, actor_usage, advice_packet, amount
+from .contracts import ACTOR_INSTANCE, ACTOR_SYSTEM, CONTRACT_VERSION, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
 from .models import ModelError, RequestOutcomeUnknown
 from .store import RunStore
 
@@ -49,9 +49,11 @@ class AdvisoryAgent(DefaultAgent):
         self.advice_store = RunStore(output_dir / "advice", run_id=advice.get("run_id") or str(uuid4()), secrets=secrets)
         self.last_checkpoint = -1
         self.advisor_calls = self.advisor_failures = self.unknown_advisor_costs = 0
+        self.advisor_api_calls = self.recorded_advisor_requests = self.advisor_fallbacks = 0
         self.advisor_cost = Decimal("0")
         self.advisor_prompt_tokens = self.advisor_completion_tokens = 0
         self.pending_advice = None
+        self.advice_records: dict[str, dict] = {}
         self.state = {}
         self.observation_ids: set[str] = set()
         self.patch_id = None
@@ -79,7 +81,7 @@ class AdvisoryAgent(DefaultAgent):
 
     def handle_uncaught_exception(self, error):
         messages = super().handle_uncaught_exception(error)
-        if isinstance(error, ModelError) and error.response:
+        if isinstance(error, ModelError) and not isinstance(error, AdvisorUnavailable) and error.response:
             # Failed provider generations may still return billed usage.
             messages[0]["extra"]["response"] = error.response
             self.advice_store.append_event("actor_failed_usage", {"actor_call": self.n_calls,
@@ -114,6 +116,7 @@ class AdvisoryAgent(DefaultAgent):
         # DefaultAgent owns call counting and billing, including format-error calls.
         self.model.actor_call = self.n_calls + 1
         self.model.pending_advice = self.pending_advice
+        self.model.advice_records = self.advice_records
         self.model.observation_ids = self.observation_ids
         return super().query()
 
@@ -125,12 +128,8 @@ class AdvisoryAgent(DefaultAgent):
             action = actions[0]
             validate_action(action["name"], {key: value for key, value in action.items() if key not in {"name", "tool_call_id"}})
             decision = action.get("advice_decision")
-            if self.pending_advice and (not decision or decision["advice_id"] != self.pending_advice):
-                raise ValueError(f"advice_decision for {self.pending_advice} is required")
-            if not self.pending_advice and decision:
-                raise ValueError("No advisor guidance is awaiting a decision")
-            if action["name"] == "submit" and set(action["validation_refs"]) - self.observation_ids:
-                raise ValueError("Unknown validation reference")
+            validate_advice_context(action, pending_advice=self.pending_advice,
+                                   records=self.advice_records, observation_ids=self.observation_ids)
         except (ValueError, KeyError, TypeError) as error:
             self.advice_store.append_event("actor_schema_error", {"actor_call": self.n_calls, "error": str(error)})
             # A parsed assistant tool call is already in the transcript; close it
@@ -143,7 +142,14 @@ class AdvisoryAgent(DefaultAgent):
             "action": action, "state": self.state, "patch_id": self.patch_id})
         if decision:
             self.advice_store.append_event("advice_decision", {"actor_call": self.n_calls, **decision})
+            record = self.advice_records[decision["advice_id"]]
+            record.update(decision=decision, status="rejected" if decision["decision"] == "reject" else "acknowledged")
+            self._advice_status(record)
             self.pending_advice = None
+        for progress in action.get("advice_progress", []):
+            record = self.advice_records[progress["advice_id"]]
+            record.update(status=progress["status"], progress=progress)
+            self._advice_status(record)
         if action["name"] == "submit":
             self.advice_store.append_event("submission", {"actor_call": self.n_calls,
                 "summary": action["summary"], "validation_refs": action["validation_refs"], "patch_id": self.patch_id})
@@ -161,6 +167,13 @@ class AdvisoryAgent(DefaultAgent):
             visible["output"] = text[:half] + f"\n[... {len(text) - 2 * half} chars omitted; full output retained ...]\n" + text[-half:]
         self._snapshot("after_action")
         self.observation_ids.add(observation_id)
+        for record in self.advice_records.values():
+            if record["status"] in OPEN_ADVICE_STATUSES:
+                record["actions"].append({"actor_call": self.n_calls, "command": action["command"],
+                    "observation_id": observation_id, "patch_id": self.patch_id,
+                    "returncode": output.get("returncode"), "exception_info": output.get("exception_info", "")})
+                record["status"] = "in_progress"
+                self._advice_status(record)
         visible["extra"] = {"observation_id": observation_id, "patch_id": self.patch_id,
                             "output_truncated": len(text) > self.max_observation_chars}
         visible = self.advice_store.redact(visible)
@@ -168,9 +181,18 @@ class AdvisoryAgent(DefaultAgent):
         # Advertise the evidence ID without changing the saved raw command output.
         for observation in observations:
             observation["content"] = f"[{observation_id}; {self.patch_id}]\n" + observation["content"]
+            open_ids = [key for key, record in self.advice_records.items() if record["status"] in OPEN_ADVICE_STATUSES]
+            if open_ids:
+                observation["content"] += f"\nOpen advice: {json.dumps(open_ids)}. Include advice_progress for each ID in your next action; cite recorded observations to resolve it."
         self.advice_store.append_event("visible_observation", {"actor_call": self.n_calls,
             "observation_id": observation_id, "patch_id": self.patch_id, "messages": observations})
         return self.add_messages(*observations)
+
+    def _advice_status(self, record):
+        self.advice_store.append_event("advice_status", {"actor_call": self.n_calls,
+            "advice_id": record["advice_id"], "status": record["status"],
+            "decision": record.get("decision"), "progress": record.get("progress"),
+            "latest_action": record["actions"][-1] if record["actions"] else None})
 
     def _snapshot(self, reason):
         result = self.env.execute({"command": PATCH_COMMAND, "source": "controller"})
@@ -188,7 +210,29 @@ class AdvisoryAgent(DefaultAgent):
                 "patch_id": self.patch_id, "reason": reason, "artifact": artifact, "sha256": digest})
 
     def _advisor_record(self, kind, payload):
+        if kind == "model_request":
+            self.recorded_advisor_requests += 1
         self.advice_store.append_event(kind, {"model_role": "advisor", "actor_call": self.n_calls, **payload})
+
+    def _account_advisor(self, *, completion=None, error=None):
+        attempts = (completion.attempts if completion else error.attempts) or ()
+        if attempts:
+            usages = [attempt["usage"] for attempt in attempts]
+            self.advisor_fallbacks += int(len(attempts) > 1)
+        elif completion:
+            usages = [{**completion.raw_usage, "cost": completion.cost_usd,
+                       "prompt_tokens": completion.prompt_tokens, "completion_tokens": completion.completion_tokens}]
+        else:
+            usages = [error.response.get("usage") or {}]
+        self.advisor_api_calls += len(usages)
+        for usage in usages:
+            cost = amount(usage.get("cost"))
+            if cost is None:
+                self.unknown_advisor_costs += 1
+            else:
+                self.advisor_cost += cost
+            self.advisor_prompt_tokens += int(usage.get("prompt_tokens") or 0)
+            self.advisor_completion_tokens += int(usage.get("completion_tokens") or 0)
 
     def _consult(self):
         if self.advisor_calls >= self.policy.max_calls:
@@ -197,7 +241,8 @@ class AdvisoryAgent(DefaultAgent):
         packet = advice_packet(task=self.extra_template_vars.get("task", ""), messages=self.messages,
             diff=self.patch_text, question=SCHEDULED_QUESTION, actor_calls=self.n_calls,
             actor_limit=self.config.step_limit, max_chars=self.policy.max_context_chars,
-            state=self.state, patch_id=self.patch_id)
+            state=self.state, patch_id=self.patch_id,
+            followthrough=list(self.advice_records.values()))
         packet = self.advice_store.redact(packet)
         self.advisor_calls += 1
         advice_id = f"advice-{self.advisor_calls}"
@@ -214,27 +259,15 @@ class AdvisoryAgent(DefaultAgent):
         except (ModelError, ValueError) as error:
             self.advisor_failures += 1
             response = error.response if isinstance(error, ModelError) else {}
-            usage = response.get("usage") or {}
-            cost = amount(usage.get("cost"))
-            if cost is None:
-                self.unknown_advisor_costs += 1
-            else:
-                self.advisor_cost += cost
-            self.advisor_prompt_tokens += int(usage.get("prompt_tokens") or 0)
-            self.advisor_completion_tokens += int(usage.get("completion_tokens") or 0)
+            self._account_advisor(error=error if isinstance(error, ModelError) else ModelError(str(error)))
             self.advice_store.append_event("advice_failed", {"actor_call": self.n_calls,
                 "advice_id": advice_id, "request_id": request_id, "error": str(error),
-                "outcome_unknown": isinstance(error, RequestOutcomeUnknown), "cost_usd": cost,
+                "outcome_unknown": isinstance(error, RequestOutcomeUnknown), "cost_usd": amount((response.get("usage") or {}).get("cost")),
+                "attempts": error.attempts if isinstance(error, ModelError) else (),
                 "response": response,
                 "duration_seconds": time.monotonic() - started})
-            return "Advisor request failed. Continue independently using public evidence."
-        cost = amount(completion.cost_usd)
-        if cost is None:
-            self.unknown_advisor_costs += 1
-        else:
-            self.advisor_cost += cost
-        self.advisor_prompt_tokens += completion.prompt_tokens
-        self.advisor_completion_tokens += completion.completion_tokens
+            raise AdvisorUnavailable(f"Advisor consultation {advice_id} failed: {error}") from error
+        self._account_advisor(completion=completion)
         self.advice_store.append_event("advice_received", {"actor_call": self.n_calls,
             "advice_id": advice_id, "request_id": request_id, "completion": completion,
             "duration_seconds": time.monotonic() - started})
@@ -244,8 +277,10 @@ class AdvisoryAgent(DefaultAgent):
             self.advisor_failures += 1
             self.advice_store.append_event("advice_schema_error", {"actor_call": self.n_calls,
                 "advice_id": advice_id, "error": str(error)})
-            return "Advisor returned malformed or empty guidance. Continue independently."
+            raise AdvisorUnavailable(f"Advisor consultation {advice_id} returned invalid guidance: {error}") from error
         self.pending_advice = advice_id
+        self.advice_records[advice_id] = {"advice_id": advice_id, "guidance": guidance,
+            "status": "delivered", "actions": []}
         self.advice_store.append_event("advice_delivered", {"actor_call": self.n_calls,
             "advice_id": advice_id, "guidance": guidance})
         return f"Advisor guidance ({advice_id}):\n{json.dumps(guidance)}\nInclude advice_decision for {advice_id} in your next action."
@@ -254,6 +289,9 @@ class AdvisoryAgent(DefaultAgent):
         data = super().serialize(*extra_dicts)
         actor = actor_usage(self.messages, self.n_calls)
         advisor = {"api_calls": self.advisor_calls, "failures": self.advisor_failures,
+            "logical_calls": self.advisor_calls,
+            "physical_api_calls": max(self.advisor_api_calls, self.recorded_advisor_requests),
+            "fallback_calls": self.advisor_fallbacks,
             "unknown_cost_calls": self.unknown_advisor_costs, "observed_cost_usd": str(self.advisor_cost),
             "cost_usd": str(self.advisor_cost) if not self.unknown_advisor_costs else None,
             "prompt_tokens": self.advisor_prompt_tokens, "completion_tokens": self.advisor_completion_tokens}
@@ -263,6 +301,7 @@ class AdvisoryAgent(DefaultAgent):
             "actor": actor, "advisor": advisor, "total_cost_usd": total,
             "stop_reason": data["info"].get("exit_status"), "final_patch_id": self.patch_id,
             "duration_seconds": time.monotonic() - self.started}
+        metrics["advice_followthrough"] = self.advice_records
         data["info"]["poc_metrics"] = metrics
         self.advice_store.write_summary(metrics)
         return self.advice_store.redact(data)

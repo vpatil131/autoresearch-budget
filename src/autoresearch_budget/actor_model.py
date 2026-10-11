@@ -13,7 +13,7 @@ from minisweagent.exceptions import FormatError
 from minisweagent.models.openrouter_model import OpenRouterModel
 
 from .advisor import amount
-from .contracts import actor_tools, parse_actor_response
+from .contracts import OPEN_ADVICE_STATUSES, actor_tools, parse_actor_response, validate_advice_context
 from .models import OpenRouterClient
 
 
@@ -24,6 +24,7 @@ class StructuredActorModel(OpenRouterModel):
         self.store = None
         self.actor_call = 0
         self.pending_advice = None
+        self.advice_records: dict[str, dict] = {}
         self.observation_ids: set[str] = set()
 
     def bind(self, store):
@@ -60,10 +61,15 @@ class StructuredActorModel(OpenRouterModel):
         if kwargs:
             raise ValueError("Per-call actor overrides are not supported in phase 1")
         prepared = self._prepare_messages_for_api(messages)
+        active = tuple(key for key, record in self.advice_records.items() if record["status"] in OPEN_ADVICE_STATUSES)
+        tools = actor_tools(self.pending_advice, active)
+        client = self._client()
+        if isinstance(client, OpenRouterClient):
+            client.tools = tools
         request_id = f"{self.store.run_id if self.store else 'actor'}:actor:{self.actor_call}"
-        self._record("actor_input", {"request_id": request_id, "messages": prepared, "tools": actor_tools()})
+        self._record("actor_input", {"request_id": request_id, "messages": prepared, "tools": tools})
         started = time.monotonic()
-        completion = asyncio.run(self._client().complete(prepared, request_id=request_id,
+        completion = asyncio.run(client.complete(prepared, request_id=request_id,
                                   max_tokens=getattr(self, "max_tokens", self.config.model_kwargs.get("max_tokens", 4096))))
         response = completion.raw_response
         cost = amount(completion.cost_usd)
@@ -72,14 +78,8 @@ class StructuredActorModel(OpenRouterModel):
             "duration_seconds": time.monotonic() - started, "cost_usd": cost, "usage": completion.raw_usage})
         try:
             action = parse_actor_response(response)
-            decision = action.get("advice_decision")
-            if self.pending_advice:
-                if not decision or decision["advice_id"] != self.pending_advice:
-                    raise ValueError(f"advice_decision for {self.pending_advice} is required")
-            elif decision:
-                raise ValueError("No advisor guidance is awaiting a decision")
-            if action["name"] == "submit" and set(action["validation_refs"]) - self.observation_ids:
-                raise ValueError("validation_refs contains unknown observation IDs")
+            validate_advice_context(action, pending_advice=self.pending_advice,
+                                   records=self.advice_records, observation_ids=self.observation_ids)
         except (ValueError, TypeError, KeyError) as error:
             self._record("actor_schema_error", {"request_id": request_id, "error": str(error)})
             raise FormatError({"role": "user", "content": f"Tool schema error: {error}. Use exactly one execute or submit tool with valid structured state.",

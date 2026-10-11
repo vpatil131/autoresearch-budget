@@ -166,7 +166,8 @@ class BatchRunner:
                 "models": {role: {"model": self.config.profiles[name].model,
                                   "provider": self.config.profiles[name].provider,
                                   "service_tier": self.config.profiles[name].service_tier,
-                                  "reasoning_effort": self.config.profiles[name].reasoning_effort}
+                                  "reasoning_effort": self.config.profiles[name].reasoning_effort,
+                                  "fallback": self.config.profiles[name].fallback}
                            for role, name in (("actor", self.profile),
                                               ("advisor", self.config.consultation["advisor_profile"]))},
                 "pending": pending, "unresolved_attempts": unresolved,

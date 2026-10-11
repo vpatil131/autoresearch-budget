@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .budget import BudgetLedger
-from .advisor import AdvicePolicy
+from .advisor import AdvicePolicy, validate_advisor_routes
 from .store import RunStore
 
 
@@ -29,6 +29,7 @@ class ModelProfile:
     reasoning_effort: str | None
     service_tier: str | None
     provider: dict[str, Any] | None
+    fallback: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class ExperimentConfig:
                 reasoning_effort=value.get("reasoning_effort"),
                 service_tier=value.get("service_tier"),
                 provider=value.get("provider"),
+                fallback=value.get("fallback"),
             )
             for name, value in raw["profiles"].items()
         }
@@ -251,6 +253,11 @@ class HarborTrialRunner:
         advisor = self.config.consultation.get("advisor_profile", "frontier")
         if advisor not in self.config.profiles:
             raise RunnerConfigError(f"unknown advisor profile {advisor!r}")
+        profile = self.config.profiles[advisor]
+        try:
+            validate_advisor_routes({"provider": profile.provider, "fallback": profile.fallback})
+        except ValueError as error:
+            raise RunnerConfigError(str(error)) from error
         manifest = self.config.consultation.get("task_manifest")
         if not manifest:
             raise RunnerConfigError("the SWE POC requires a frozen task_manifest")
@@ -403,6 +410,7 @@ class HarborTrialRunner:
                     "advisor": {
                         "model": advisor.model, "reasoning_effort": advisor.reasoning_effort,
                         "service_tier": advisor.service_tier, "provider": advisor.provider,
+                        "fallback": advisor.fallback,
                     },
                     "run_id": self._job_name(spec),
                 },

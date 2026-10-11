@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from .models import Completion, CompletionBackend, OpenRouterClient
+from .models import Completion, CompletionBackend, FallbackClient, ModelError, OpenRouterClient
 
 
 POLICIES = {"actor_only", "fixed_interval"}
@@ -22,7 +22,31 @@ in the packet. Do not seek benchmark solutions, hidden tests, or verifier result
 Return only a JSON object with assessment, gap, next_action, validation, and
 assumptions (an array of strings). Identify a
 concrete uncertainty and a falsifiable next action; do not claim verified success.
+Review advice_followthrough when present: distinguish acknowledgment from actual
+execution and validation. Identify unfinished recommendations or unsupported
+claims using recorded commands and public observations. Recommend the next step.
 """
+
+
+class AdvisorUnavailable(ModelError):
+    """No usable guidance; the attempt is an integration failure."""
+
+
+def validate_advisor_routes(profile: dict[str, Any]) -> None:
+    fallback = profile.get("fallback")
+    if fallback is None:
+        return
+    if not isinstance(fallback, dict) or set(fallback) - {"provider", "service_tier", "max_tokens_parameter"}:
+        raise ValueError("Advisor fallback can only change provider, tier, and output allowance parameter")
+    for provider in (profile.get("provider"), fallback.get("provider")):
+        if (not isinstance(provider, dict) or not isinstance(provider.get("only"), list)
+                or not provider["only"] or any(not isinstance(name, str) or not name for name in provider["only"])
+                or provider.get("allow_fallbacks") is not False):
+            raise ValueError("Both advisor routes must select explicit providers with allow_fallbacks=false")
+    if fallback.get("service_tier") == "flex":
+        raise ValueError("Advisor fallback must not request Flex processing")
+    if fallback.get("max_tokens_parameter", "max_tokens") not in {"max_tokens", "max_completion_tokens"}:
+        raise ValueError("Unsupported fallback output allowance parameter")
 
 
 @dataclass(frozen=True)
@@ -93,6 +117,7 @@ def advice_packet(
     *, task: str, messages: list[dict], diff: str, question: str,
     actor_calls: int, actor_limit: int, max_chars: int,
     state: dict | None = None, patch_id: str | None = None,
+    followthrough: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Bound model-visible public evidence, retaining excerpts of large observations."""
     if max_chars < 1000:
@@ -120,9 +145,15 @@ def advice_packet(
         "current_patch": {"patch_id": patch_id, "diff": clip(diff, max_chars // 4)},
         "recent_transcript": [], "context_truncated": False,
     }
+    if followthrough:
+        # Reserve bounded space for advice history instead of silently letting
+        # growing command records displace the entire packet.
+        packet["advice_followthrough"] = clip(json.dumps(followthrough, ensure_ascii=False), max_chars // 4)
     # Escape-heavy strings can expand beyond the initial character allocation.
     while len(json.dumps(packet, ensure_ascii=False)) > max_chars - 250:
         choices = [(packet, "goal"), (packet, "question"), (packet["current_patch"], "diff")]
+        if "advice_followthrough" in packet:
+            choices.append((packet, "advice_followthrough"))
         if "hypothesis" in current_state:
             choices.append((current_state, "hypothesis"))
         obj, key = max(choices, key=lambda item: len(item[0][item[1]]))
@@ -166,8 +197,10 @@ class Advisor:
 
     @classmethod
     def from_profile(cls, profile: dict[str, Any], api_key: str, max_tokens: int, recorder=None) -> "Advisor":
+        validate_advisor_routes(profile)
         effort = profile.get("reasoning_effort")
-        return cls(OpenRouterClient(
+        fallback = profile.get("fallback")
+        primary = OpenRouterClient(
             api_key=api_key,
             model=profile["model"],
             reasoning={"effort": effort} if effort else None,
@@ -175,7 +208,17 @@ class Advisor:
             provider=profile.get("provider"),
             allow_paid=True, recorder=recorder,
             body_options={"response_format": {"type": "json_object"}},
-        ), max_tokens)
+            retry_delays_sec=() if fallback else (2.0, 4.0, 8.0),
+        )
+        if not fallback:
+            return cls(primary, max_tokens)
+        secondary = OpenRouterClient(api_key=api_key, model=profile["model"],
+            reasoning={"effort": effort} if effort else None,
+            provider=fallback["provider"], service_tier=fallback.get("service_tier"),
+            max_tokens_parameter=fallback.get("max_tokens_parameter", "max_tokens"),
+            allow_paid=True, recorder=recorder, retry_delays_sec=(),
+            body_options={"response_format": {"type": "json_object"}})
+        return cls(FallbackClient(primary, secondary, recorder=recorder), max_tokens)
 
     def consult(self, packet: dict[str, Any], request_id: str) -> Completion:
         return asyncio.run(self.backend.complete(

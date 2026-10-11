@@ -6,15 +6,33 @@ import json
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Callable, Protocol
 
 
 class ModelError(RuntimeError):
-    def __init__(self, message: str, *, response: dict | None = None):
+    def __init__(self, message: str, *, response: dict | None = None, http_status: int | None = None):
         super().__init__(message)
         self.response = response or {}
+        self.http_status = http_status
+        self.attempts: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def availability_failure(self) -> bool:
+        error = self.response.get("error") or {}
+        if not isinstance(error, dict):
+            error = {}
+        code = error.get("code", self.http_status)
+        # Authentication and bad requests must not be disguised as outages.
+        if self.http_status in {400, 401, 403, 404, 422} or str(code) in {"400", "401", "403", "404", "422"}:
+            return False
+        unavailable = lambda status: status == 429 or status is not None and 500 <= status <= 599
+        embedded_status = int(code) if str(code).isdigit() else None
+        metadata = error.get("metadata") or {}
+        return (isinstance(self, RequestOutcomeUnknown) or unavailable(self.http_status)
+                or unavailable(embedded_status)
+                or isinstance(metadata, dict) and metadata.get("error_type") == "provider_unavailable")
 
 
 class RequestOutcomeUnknown(ModelError):
@@ -36,6 +54,7 @@ class Completion:
     provider_metadata: dict[str, Any] = field(default_factory=dict)
     raw_usage: dict[str, Any] = field(default_factory=dict)
     raw_response: dict[str, Any] = field(default_factory=dict)
+    attempts: tuple[dict[str, Any], ...] = ()
 
 
 class CompletionBackend(Protocol):
@@ -64,7 +83,7 @@ def _default_transport(
 
 
 class OpenRouterClient:
-    """Small adapter with no hidden retries or model fallbacks."""
+    """Single route adapter with bounded, recorded HTTP-429 retries."""
 
     def __init__(
         self,
@@ -82,6 +101,7 @@ class OpenRouterClient:
         tools: list[dict] | None = None,
         body_options: dict[str, Any] | None = None,
         recorder: Callable[[str, dict], Any] | None = None,
+        max_tokens_parameter: str = "max_tokens",
     ):
         if not allow_paid:
             raise ValueError("paid inference is disabled; pass allow_paid=True explicitly")
@@ -101,6 +121,11 @@ class OpenRouterClient:
         if set(self.body_options) & {"model", "messages", "metadata", "stream", "tools"}:
             raise ValueError("body_options cannot override the model request contract")
         self.recorder = recorder
+        if max_tokens_parameter not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("Unsupported output allowance parameter")
+        if set(self.body_options) & {"max_tokens", "max_completion_tokens", "provider", "service_tier"}:
+            raise ValueError("body_options cannot override route parameters")
+        self.max_tokens_parameter = max_tokens_parameter
 
     async def complete(
         self,
@@ -114,7 +139,7 @@ class OpenRouterClient:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            self.max_tokens_parameter: max_tokens,
             "stream": False,
             "metadata": {"experiment_request_id": request_id},
         }
@@ -162,23 +187,25 @@ class OpenRouterClient:
                 response = json.loads(raw)
             except json.JSONDecodeError as error:
                 raise ModelError(
-                    f"OpenRouter returned non-JSON HTTP {status}"
+                    f"OpenRouter returned non-JSON HTTP {status}", http_status=status
                 ) from error
+            if not isinstance(response, dict):
+                raise ModelError("OpenRouter response must be an object", http_status=status)
             if status != 429 or attempt == len(self.retry_delays_sec):
                 break
             if self.recorder:
                 self.recorder("model_retry", {**fields, "delay_seconds": self.retry_delays_sec[attempt], "reason": "HTTP 429"})
             await asyncio.sleep(self.retry_delays_sec[attempt])
         if status < 200 or status >= 300:
-            raise ModelError(f"OpenRouter HTTP {status}: {_error_message(response)}", response=response)
+            raise ModelError(f"OpenRouter HTTP {status}: {_error_message(response)}", response=response, http_status=status)
         if response.get("error"):
-            raise ModelError(f"OpenRouter error: {_error_message(response)}", response=response)
+            raise ModelError(f"OpenRouter error: {_error_message(response)}", response=response, http_status=status)
         choices = response.get("choices") or []
         if not choices:
             raise ModelError("OpenRouter response contained no choices", response=response)
         choice = choices[0]
         if choice.get("error") or choice.get("finish_reason") == "error":
-            raise ModelError(f"OpenRouter generation error: {_error_message(choice)}", response=response)
+            raise ModelError(f"OpenRouter generation error: {_error_message(choice)}", response={**response, "error": choice.get("error") or {}}, http_status=status)
         message = choice.get("message") or {}
         content = message.get("content")
         # Reasoning models can consume their entire output allowance before
@@ -211,6 +238,51 @@ class OpenRouterClient:
             raw_usage=usage,
             raw_response=response,
         )
+
+
+class FallbackClient:
+    """Two explicit routes for one logical request; each route is tried once."""
+
+    def __init__(self, primary: OpenRouterClient, fallback: OpenRouterClient, *, recorder=None):
+        if primary.model != fallback.model:
+            raise ValueError("Fallback must preserve the requested model")
+        if primary.retry_delays_sec or fallback.retry_delays_sec:
+            raise ValueError("Fallback routes must disable internal retries")
+        self.primary, self.fallback, self.recorder = primary, fallback, recorder
+
+    async def complete(self, messages, *, request_id, max_tokens):
+        attempts = []
+        for index, client in enumerate((self.primary, self.fallback), 1):
+            physical_id = f"{request_id}:route:{index}"
+            started = time.monotonic()
+            completion = None
+            failure = None
+            try:
+                completion = await client.complete(messages, request_id=physical_id, max_tokens=max_tokens)
+            except ModelError as error:
+                failure = error
+            response = failure.response if failure else completion.raw_response
+            usage = response.get("usage") or {}
+            attempt = {"logical_request_id": request_id, "request_id": physical_id,
+                "route_attempt": index, "provider": client.provider, "service_tier": client.service_tier,
+                "requested_model": client.model, "served_model": response.get("model"),
+                "response_id": response.get("id"), "usage": usage,
+                "cost_usd": usage.get("cost"), "success": failure is None,
+                "outcome_unknown": isinstance(failure, RequestOutcomeUnknown),
+                "error": str(failure) if failure else None,
+                "duration_seconds": time.monotonic() - started}
+            attempts.append(attempt)
+            if self.recorder:
+                self.recorder("model_route_attempt", attempt)
+            if completion:
+                return replace(completion, attempts=tuple(attempts))
+            failure.attempts = tuple(attempts)
+            if index == 2 or not failure.availability_failure:
+                raise failure
+            if self.recorder:
+                self.recorder("model_fallback", {"request_id": request_id,
+                    "from_request_id": physical_id, "to_request_id": f"{request_id}:route:2",
+                    "reason": str(failure)})
 
 
 def _error_message(value: dict[str, Any]) -> str:

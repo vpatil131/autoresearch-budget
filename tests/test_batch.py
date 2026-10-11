@@ -119,7 +119,7 @@ class BatchTest(unittest.TestCase):
             started = []; barrier = threading.Barrier(4)
             def execute(claim, source):
                 started.append(claim['task_id']); barrier.wait(timeout=5)
-                if claim['task_id'].endswith('-0'):return self.outcome(claim, stop='ModelError')
+                if claim['task_id'].endswith('-0'):return self.outcome(claim, stop='AdvisorUnavailable')
                 time.sleep(0.08)
                 return self.outcome(claim)
             runner.execute = execute

@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from autoresearch_budget.advisor import AdvicePolicy, advice_packet
+from autoresearch_budget.advisor import AdvicePolicy, advice_packet, validate_advisor_routes
 from autoresearch_budget.contracts import actor_tools, parse_actor_response, validate_guidance
 from autoresearch_budget.models import OpenRouterClient, RequestOutcomeUnknown
 from autoresearch_budget.store import RunStore
@@ -39,6 +39,23 @@ class AdvisorContractsTest(unittest.TestCase):
             question='\x00'*500, actor_calls=10, actor_limit=80, max_chars=1000)
         self.assertLessEqual(len(json.dumps(packet, ensure_ascii=False)),1000)
         self.assertTrue(packet['recent_transcript'])
+
+    def test_large_advice_history_remains_bounded_and_marks_truncation(self):
+        packet=advice_packet(task='issue',messages=[{'role':'tool','content':'latest result'}],diff='patch',
+            question='review',actor_calls=20,actor_limit=80,max_chars=1000,
+            followthrough=[{'advice_id':'advice-1','actions':[{'command':'\x00'*10000}]}])
+        self.assertLessEqual(len(json.dumps(packet,ensure_ascii=False)),1000)
+        self.assertTrue(packet['context_truncated'])
+        self.assertIn('advice_followthrough',packet)
+
+    def test_route_validation_rejects_implicit_fallbacks_and_model_changes(self):
+        provider={'only':['OpenAI'],'allow_fallbacks':False}
+        fallback={'provider':{'only':['azure'],'allow_fallbacks':False},'max_tokens_parameter':'max_completion_tokens'}
+        validate_advisor_routes({'provider':provider,'fallback':fallback})
+        for invalid in ({**fallback,'model':'different'}, {**fallback,'service_tier':'flex'},
+                        {**fallback,'provider':{'only':['azure'],'allow_fallbacks':True}}, {}, 'azure'):
+            with self.subTest(fallback=invalid), self.assertRaises(ValueError):
+                validate_advisor_routes({'provider':provider,'fallback':invalid})
 
     def test_actor_contract_rejects_prose_unknown_tools_and_invalid_state(self):
         with self.assertRaises(ValueError):

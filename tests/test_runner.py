@@ -206,6 +206,24 @@ class HarborTrialRunnerTest(unittest.TestCase):
             with self.assertRaises(RunnerConfigError):
                 runner.run(TrialSpec("owner__repo-1","small"))
 
+    def test_revised_config_carries_fallback_to_harbor_without_changing_actor(self):
+        root=Path(__file__).resolve().parents[1]
+        config=ExperimentConfig.load(root/'config/experiment.phase1.v2.json',project_root=root)
+        original=ExperimentConfig.load(root/'config/experiment.phase1.json',project_root=root)
+        command=HarborTrialRunner(config).command(TrialSpec('gotd__td-1759','small'))
+        settings=json.loads(next(arg[7:] for arg in command if arg.startswith('config=')))
+        advisor=settings['agent']['advice']['advisor']
+        self.assertEqual(advisor['model'],'openai/gpt-6.1-sol')
+        self.assertEqual(advisor['service_tier'],'flex')
+        self.assertEqual(advisor['fallback']['provider']['only'],['azure'])
+        self.assertEqual(advisor['fallback']['max_tokens_parameter'],'max_completion_tokens')
+        self.assertEqual(settings['agent']['step_limit'],80)
+        self.assertEqual(settings['agent']['advice']['every_steps'],10)
+        self.assertEqual(config.profiles['small'],original.profiles['small'])
+        self.assertNotEqual(config.jobs_root,original.jobs_root)
+        self.assertFalse(config.paid_inference_enabled)
+        self.assertFalse(config.budget_enforced)
+
     def test_poc_retains_grading_after_run_without_budget_ledger_or_overwrites(self):
         with TemporaryDirectory() as temp:
             root=Path(temp); config=self._poc_config(root,paid=True)
