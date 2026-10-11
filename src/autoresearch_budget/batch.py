@@ -1,4 +1,4 @@
-"""Bounded phase 1 scheduling; only the coordinator writes batch records."""
+"""Bounded advisor experiment scheduling; only the coordinator writes records."""
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -14,6 +14,7 @@ from typing import Callable
 
 from .runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, TrialSpec, _read_env_file
 from .store import RunStore
+from .advisor import AdvicePolicy
 
 VALID_STOPS = {"Submitted", "LimitsExceeded", "TimeExceeded", "RepeatedFormatError"}
 
@@ -51,7 +52,7 @@ def coordinator_lock(path: Path):
         try:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RunnerConfigError("another phase 1 batch coordinator owns this jobs directory") from error
+            raise RunnerConfigError("another batch coordinator owns this jobs directory") from error
         try:
             yield
         finally:
@@ -69,15 +70,16 @@ class BatchRunner:
         self.runner = HarborTrialRunner(config)
         self.execute = execute or self._execute
         if concurrency not in range(1, 5):
-            raise RunnerConfigError("phase 1 concurrency must be between 1 and 4")
-        if config.agent.get("scaffold") != "mini-swe-advisor" or config.consultation.get("policy") != "fixed_interval":
-            raise RunnerConfigError("batch execution currently supports phase 1 fixed-interval advice only")
+            raise RunnerConfigError("batch concurrency must be between 1 and 4")
+        if config.agent.get("scaffold") != "mini-swe-advisor":
+            raise RunnerConfigError("batch execution requires mini-swe-advisor")
+        self.policy = AdvicePolicy.load(config.consultation)
         manifest = config.project_root / config.consultation["task_manifest"]
         self.manifest = read_json(manifest)
         self.tasks = [t["task_id"] for t in self.manifest["tasks"]]
         if not self.tasks or len(set(self.tasks)) != len(self.tasks):
             raise RunnerConfigError("task manifest must contain distinct tasks")
-        self.raw_config = read_json(config.path)
+        self.raw_config = config.resolved_config()
         self.fingerprint = hashlib.sha256(json.dumps({"config": self.raw_config, "manifest": self.manifest,
                                                      "profile": profile}, sort_keys=True).encode()).hexdigest()
         for task in self.tasks:
@@ -160,7 +162,8 @@ class BatchRunner:
         active_batches = [p for p in active_batches if Path(p) != own or own_state.get("current_task")]
         return {"batch_dir": str(self.batch), "concurrency": self.concurrency,
                 "total_tasks": len(self.tasks), "completed_tasks": len(completed),
-                "every_steps": self.config.consultation["every_steps"],
+                "policy": self.policy.policy, "max_advice_calls": self.policy.max_calls,
+                "every_steps": self.policy.every_steps if self.policy.policy == "fixed_interval" else None,
                 "actor_max_steps": self.config.agent["max_steps"],
                 "paid_inference_enabled": self.config.paid_inference_enabled,
                 "models": {role: {"model": self.config.profiles[name].model,

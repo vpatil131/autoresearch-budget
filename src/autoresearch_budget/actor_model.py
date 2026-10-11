@@ -1,4 +1,4 @@
-"""Native phase 1 tools with recorded OpenRouter requests and responses.
+"""Native actor tools with recorded OpenRouter requests and responses.
 
 Use mini-SWE's message/observation formatting, with the project's gateway for
 observable transport attempts. Model and provider routes remain configurable.
@@ -26,6 +26,8 @@ class StructuredActorModel(OpenRouterModel):
         self.pending_advice = None
         self.advice_records: dict[str, dict] = {}
         self.observation_ids: set[str] = set()
+        self.patch_ids: set[str] = set()
+        self.advice_enabled = False
 
     def bind(self, store):
         self.store = store
@@ -59,10 +61,10 @@ class StructuredActorModel(OpenRouterModel):
 
     def query(self, messages: list[dict], **kwargs) -> dict:
         if kwargs:
-            raise ValueError("Per-call actor overrides are not supported in phase 1")
+            raise ValueError("Per-call actor overrides are not supported")
         prepared = self._prepare_messages_for_api(messages)
         active = tuple(key for key, record in self.advice_records.items() if record["status"] in OPEN_ADVICE_STATUSES)
-        tools = actor_tools(self.pending_advice, active)
+        tools = actor_tools(self.pending_advice, active, advice_enabled=self.advice_enabled)
         client = self._client()
         if isinstance(client, OpenRouterClient):
             client.tools = tools
@@ -77,12 +79,13 @@ class StructuredActorModel(OpenRouterModel):
         self._record("actor_completion", {"request_id": request_id, "response": response,
             "duration_seconds": time.monotonic() - started, "cost_usd": cost, "usage": completion.raw_usage})
         try:
-            action = parse_actor_response(response)
+            action = parse_actor_response(response, advice_enabled=self.advice_enabled)
             validate_advice_context(action, pending_advice=self.pending_advice,
-                                   records=self.advice_records, observation_ids=self.observation_ids)
+                                   records=self.advice_records, observation_ids=self.observation_ids, patch_ids=self.patch_ids)
         except (ValueError, TypeError, KeyError) as error:
             self._record("actor_schema_error", {"request_id": request_id, "error": str(error)})
-            raise FormatError({"role": "user", "content": f"Tool schema error: {error}. Use exactly one execute or submit tool with valid structured state.",
+            names = ", ".join(tool["function"]["name"] for tool in tools)
+            raise FormatError({"role": "user", "content": f"Tool schema error: {error}. Use exactly one enabled tool ({names}) with valid structured state.",
                                "extra": {**extra, "interrupt_type": "FormatError"}}) from error
         message = dict(response["choices"][0]["message"])
         message["extra"] = {**extra, "actions": [action]}

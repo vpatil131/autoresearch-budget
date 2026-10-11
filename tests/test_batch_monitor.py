@@ -27,6 +27,20 @@ class BatchMonitorTest(unittest.TestCase):
         self.assertTrue(result['event_sequence_contiguous'])
         self.assertFalse(summarize({}, [*self.events().splitlines(), '{'])['event_sequence_contiguous'])
 
+    def test_requested_advice_reports_consumption_and_denials_without_checkpoints(self):
+        entries=[('actor_advice_request',{'actor_call':2,'question':'Why?','evidence_ids':['observation-1']}),
+                 ('advice_requested',{'actor_call':2,'reason':'advice_requested'}),
+                 ('advice_delivered',{}),('actor_advice_request',{'actor_call':4}),
+                 ('advice_denied',{'reason':'call_limit'})]
+        events=[json.dumps({'sequence':i,'kind':kind,'payload':payload}) for i,(kind,payload) in enumerate(entries,1)]
+        result=summarize({'max_advice_calls':1},events)
+        self.assertEqual(result['checkpoints'],[])
+        self.assertEqual(len(result['advice_requests']),2)
+        self.assertEqual(result['advice_dispatched'],1)
+        self.assertEqual(result['advice_delivered'],1)
+        self.assertEqual(result['advice_calls_remaining'],0)
+        self.assertEqual(result['advice_denials'],{'call_limit':1})
+
     def test_all_four_live_tasks_are_inspected_with_local_fallback(self):
         with TemporaryDirectory() as temp:
             root = Path(temp); active = []

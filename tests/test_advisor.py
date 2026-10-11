@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from autoresearch_budget.advisor import AdvicePolicy, advice_packet, validate_advisor_routes
-from autoresearch_budget.contracts import actor_tools, parse_actor_response, validate_guidance
+from autoresearch_budget.contracts import actor_tools, parse_actor_response, validate_guidance, validate_action, validate_advice_context
 from autoresearch_budget.models import OpenRouterClient, RequestOutcomeUnknown
 from autoresearch_budget.store import RunStore
 
@@ -17,9 +17,40 @@ class AdvisorContractsTest(unittest.TestCase):
         self.assertEqual([i for i in range(81) if policy.scheduled(i, 80, -1)], list(range(10, 80, 10)))
         self.assertFalse(policy.scheduled(10, 80, 10))
         self.assertFalse(AdvicePolicy(policy='actor_only').scheduled(10, 80, -1))
-        for invalid in ({'every_steps': True}, {'max_calls': 0}, {'policy':'actor_requested'}, {'policy':'hybrid'}):
+        self.assertEqual(AdvicePolicy.load({'max_calls': 0}).max_calls, 0)
+        self.assertFalse(AdvicePolicy.load({'policy': 'advice_requested'}).scheduled(10, 80, -1))
+        for invalid in ({'every_steps': True}, {'max_calls': -1}, {'max_calls': True},
+                        {'policy':'actor_requested'}, {'policy':'hybrid'},
+                        {'policy':'advice_requested','every_steps':10}):
             with self.assertRaises(ValueError):
                 AdvicePolicy.load(invalid)
+
+    def test_request_schema_and_seen_evidence_validation(self):
+        args = {'question': 'Which hypothesis fits?', 'evidence_ids': ['observation-1', 'patch-2'],
+                'state': {'phase': 'diagnose', 'uncertainty': 'high', 'blocker': 'conflicting_evidence'}}
+        action = validate_action('request_advice', args, advice_enabled=True)
+        validate_advice_context(action, pending_advice=None, records={},
+                                observation_ids={'observation-1'}, patch_ids={'patch-2'})
+        for ids in ([], ['observation-1', 'observation-1'], ['x'] * 9, ['x' * 81]):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                validate_action('request_advice', {**args, 'evidence_ids': ids}, advice_enabled=True)
+        for pending, patches in ((None, set()), ('advice-1', {'patch-2'})):
+            with self.assertRaises(ValueError):
+                validate_advice_context(action, pending_advice=pending, records={},
+                                        observation_ids={'observation-1'}, patch_ids=patches)
+        self.assertIn('request_advice', {tool['function']['name'] for tool in actor_tools(advice_enabled=True)})
+
+    def test_cited_evidence_is_retained_before_recent_transcript(self):
+        for limit in (1000, 60000):
+            packet = advice_packet(task='issue', messages=[{'role': 'tool', 'content': 'recent' * 10000}],
+                diff='diff', question='Why did the old check fail?', actor_calls=30, actor_limit=80,
+                max_chars=limit, reason='advice_requested', advice_calls_remaining=2,
+                cited_evidence={'observation-1': 'old failure' + 'x' * 20000,
+                                'patch-2': 'old patch'})
+            self.assertLessEqual(len(json.dumps(packet, ensure_ascii=False)), limit)
+            self.assertEqual(packet['reason'], 'advice_requested')
+            self.assertIn('old failure', packet['cited_evidence']['observation-1'])
+            self.assertEqual(packet['cited_evidence']['patch-2'], 'old patch')
 
     def test_packet_retains_oversized_recent_evidence_and_excludes_raw_payload(self):
         messages = [{'role':'system','content':'secret policy'}, {'role':'tool','content':'start'+'x'*10000+'end',

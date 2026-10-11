@@ -1,4 +1,4 @@
-"""Phase 1 tool contracts, independent of the model SDK."""
+"""Actor/advisor tool contracts, independent of the model SDK."""
 from __future__ import annotations
 
 import json
@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 CONTRACT_VERSION = "phase1-v2"
+PHASE2_CONTRACT_VERSION = "phase2-v1"
 ACTOR_SYSTEM = """You solve software engineering issues using the repository and visible checks.
 Own the diagnosis, edits, validation, and submission. Every response must call
 exactly one native tool: execute or submit. Use execute for shell commands;
@@ -33,6 +34,38 @@ Inspect relevant code, reproduce the issue, implement a fix, and validate it.
 Use the execute tool for commands and submit for completion. There is no shell
 submission command. Report concise reasoning and structured state with each tool.
 """
+
+
+def actor_prompts(policy: str, every_steps: int, max_calls: int) -> tuple[str, str]:
+    system = ACTOR_SYSTEM.replace("every 10", f"every {every_steps}")
+    instance = ACTOR_INSTANCE
+    if policy == "actor_only":
+        system = system.replace(f"Optional advisor guidance arrives every {every_steps}\nactor calls.",
+                                "Advisor consultation is disabled for this attempt.")
+    elif policy == "advice_requested":
+        system = ACTOR_SYSTEM.replace("exactly one native tool: execute or submit.",
+                                     "exactly one native tool: execute, request_advice, or submit.")
+        system = system.replace("Optional advisor guidance arrives every 10\nactor calls.", f"""You decide whether and when to consult the advisor. Advice is optional.
+Consider requesting advice early, after initial inspection, when competing
+hypotheses remain or the expected API contract is unclear. Before a substantial
+edit or expensive validation run, consult if an unresolved question could change
+your implementation or validation plan. If two checks fail without clarifying
+the cause, consider consulting with those results instead of repeating the same
+approach. You may consult at other points when a focused uncertainty makes
+progress difficult. Do not wait until most actor calls are spent to raise an
+uncertainty you already recognize. Request only when you can name a question
+whose answer could change your next action; there is no minimum number of calls.
+Ask a specific question and cite observation or patch IDs you have seen in
+evidence_ids.
+Do not delegate the whole task. You own the solution. You have at most {max_calls}
+logical consultations for this attempt; the controller reports remaining
+capacity each turn. Each request consumes one actor turn. There are no scheduled
+consultations. If the limit is reached, continue independently. Acknowledge
+pending guidance before requesting more advice.""")
+        system = system.replace("how this command advances its", "how this action advances its")
+        instance = instance.replace("Use the execute tool for commands and submit for completion.",
+            "Use execute for commands, request_advice for focused consultation, and submit for completion.")
+    return system, instance
 
 STATE_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -70,15 +103,22 @@ PROGRESS_SCHEMA = {
 OPEN_ADVICE_STATUSES = {"acknowledged", "in_progress"}
 
 
-def actor_tools(pending_advice: str | None = None, active_advice: tuple[str, ...] = ()) -> list[dict]:
+def actor_tools(pending_advice: str | None = None, active_advice: tuple[str, ...] = (), *, advice_enabled=False) -> list[dict]:
     tools = []
-    for name, description, properties, required in (
+    definitions = [
         ("execute", "Execute a shell command in the repository.", {"command": {"type": "string"}}, ["command"]),
         ("submit", "Finish the attempt and submit the current candidate.", {
             "summary": {"type": "string"},
             "validation_refs": {"type": "array", "items": {"type": "string"}},
         }, ["summary", "validation_refs"]),
-    ):
+    ]
+    if advice_enabled:
+        definitions.append(("request_advice", "Ask the advisor a focused question using observed evidence.", {
+            "question": {"type": "string", "minLength": 1, "maxLength": 4000},
+            "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": True,
+                             "items": {"type": "string", "minLength": 1, "maxLength": 80}},
+        }, ["question", "evidence_ids"]))
+    for name, description, properties, required in definitions:
         properties = {**properties, "state": deepcopy(STATE_SCHEMA)}
         required = [*required, "state"]
         if pending_advice:
@@ -107,15 +147,17 @@ def _text(value: Any, field: str, *, empty: bool = False) -> None:
 
 def _refs(value: Any, field: str, *, nonempty: bool = False) -> None:
     if not isinstance(value, list) or any(not isinstance(ref, str) or not ref for ref in value) or nonempty and not value:
-        raise ValueError(f"{field} must be {'a nonempty' if nonempty else 'an'} array of observation IDs")
+        raise ValueError(f"{field} must be {'a nonempty' if nonempty else 'an'} array of evidence IDs")
 
 
-def validate_action(name: str, args: Any) -> dict:
-    if name not in {"execute", "submit"}:
-        raise ValueError(f"Unknown phase 1 tool: {name}")
+def validate_action(name: str, args: Any, *, advice_enabled=False) -> dict:
+    if name not in ({"execute", "submit", "request_advice"} if advice_enabled else {"execute", "submit"}):
+        raise ValueError(f"Unknown or disabled actor tool: {name}")
     if not isinstance(args, dict):
         raise ValueError("Tool arguments must be an object")
-    fields = {"state", "advice_decision", "advice_progress"} | ({"command"} if name == "execute" else {"summary", "validation_refs"})
+    fields = {"state", "advice_decision", "advice_progress"} | {
+        "execute": {"command"}, "submit": {"summary", "validation_refs"},
+        "request_advice": {"question", "evidence_ids"}}[name]
     if set(args) - fields:
         raise ValueError(f"Unexpected tool arguments: {sorted(set(args) - fields)}")
     state = args.get("state")
@@ -155,6 +197,12 @@ def validate_action(name: str, args: Any) -> dict:
             _refs(item["evidence_refs"], "advice_progress.evidence_refs", nonempty=item["status"] != "in_progress")
     if name == "execute":
         _text(args.get("command"), "command")
+    elif name == "request_advice":
+        _text(args.get("question"), "question")
+        _refs(args.get("evidence_ids"), "evidence_ids", nonempty=True)
+        ids = args["evidence_ids"]
+        if len(args["question"]) > 4000 or len(ids) > 8 or len(set(ids)) != len(ids) or any(len(ref) > 80 for ref in ids):
+            raise ValueError("Advice requests require a question of at most 4000 characters and 1–8 distinct evidence IDs of at most 80 characters")
     else:
         _text(args.get("summary"), "summary")
         refs = args.get("validation_refs")
@@ -163,9 +211,14 @@ def validate_action(name: str, args: Any) -> dict:
 
 
 def validate_advice_context(action: dict, *, pending_advice: str | None,
-                            records: dict[str, dict], observation_ids: set[str]) -> None:
+                            records: dict[str, dict], observation_ids: set[str], patch_ids: set[str] | None = None) -> None:
     """Gate commands/submission using recorded state, not parsed prose."""
     decision = action.get("advice_decision")
+    if action["name"] == "request_advice":
+        if pending_advice:
+            raise ValueError("Acknowledge pending guidance before requesting more advice")
+        if set(action["evidence_ids"]) - (observation_ids | (patch_ids or set())):
+            raise ValueError("Advice request contains unknown or unseen evidence IDs")
     if pending_advice:
         if not decision or decision["advice_id"] != pending_advice:
             raise ValueError(f"advice_decision for {pending_advice} is required")
@@ -193,16 +246,16 @@ def validate_advice_context(action: dict, *, pending_advice: str | None,
         raise ValueError("validation_refs contains unknown observation IDs")
 
 
-def parse_actor_response(response: dict) -> dict:
+def parse_actor_response(response: dict, *, advice_enabled=False) -> dict:
     choices = response.get("choices") or []
     calls = (choices[0].get("message", {}).get("tool_calls") or []) if choices else []
     if len(calls) != 1:
-        raise ValueError("Every actor response requires exactly one execute or submit tool call")
+        raise ValueError("Every actor response requires exactly one enabled native tool call")
     call = calls[0]
     if call.get("type") != "function" or not call.get("id"):
         raise ValueError("A function tool call with an ID is required")
     function = call.get("function") or {}
-    action = validate_action(function.get("name"), json.loads(function.get("arguments", "")))
+    action = validate_action(function.get("name"), json.loads(function.get("arguments", "")), advice_enabled=advice_enabled)
     return {**action, "tool_call_id": call["id"]}
 
 

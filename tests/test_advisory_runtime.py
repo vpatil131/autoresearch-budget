@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import subprocess
+import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -61,7 +62,9 @@ class AdvisoryRuntimeTest(unittest.TestCase):
     def git(self,*args):
         return subprocess.run(['git',*args],cwd=self.repo,check=True,capture_output=True,text=True)
 
-    def agent(self,responses,*,limit=80,k=10,advisor_content=None,advisor=None):
+    def agent(self,responses,*,limit=80,k=10,advisor_content=None,advisor=None,
+              policy='fixed_interval',max_calls=100,max_context_chars=60000,wall_time_limit_seconds=0,
+              production_template=False):
         self.requests=[]
         queue=list(responses)
         def transport(request, timeout):
@@ -69,9 +72,11 @@ class AdvisoryRuntimeTest(unittest.TestCase):
             if not queue:
                 raise AssertionError('Unexpected model call')
             return 200,json.dumps(queue.pop(0)).encode()
+        formatting={'observation_template':get_config_from_spec('mini')['model']['observation_template']}
+        if not production_template:formatting={'observation_template':'{{ output.output }}'}
         actor=StructuredActorModel(model_name='openrouter/mock/actor',backend=OpenRouterClient(
             api_key='offline-test-key',model='mock/actor',allow_paid=True,transport=transport),
-            observation_template='{{ output.output }}')
+            **formatting)
         env=PocEnvironment(cwd=str(self.repo),env={'OPENROUTER_API_KEY':'','MSWEA_API_KEY':''})
         if advisor is None:
             def advice_transport(request,timeout):
@@ -80,8 +85,11 @@ class AdvisoryRuntimeTest(unittest.TestCase):
                     'usage':{'cost':0.02,'prompt_tokens':20,'completion_tokens':10}}).encode()
             advisor=Advisor(OpenRouterClient(api_key='offline-test-key',model='mock/advisor',allow_paid=True,
                                            transport=advice_transport),128)
-        agent=AdvisoryAgent(actor,env,advice={'every_steps':k,'run_id':'offline-task'},advisor=advisor,
+        advice={'policy':policy,'max_calls':max_calls,'max_context_chars':max_context_chars,'run_id':'offline-task'}
+        if policy == 'fixed_interval':advice['every_steps']=k
+        agent=AdvisoryAgent(actor,env,advice=advice,advisor=advisor,
             cost_limit=0,step_limit=limit,system_template='ignored',instance_template='ignored',
+            wall_time_limit_seconds=wall_time_limit_seconds,
             output_path=self.root/'agent'/'mini-swe-agent.trajectory.json',max_observation_chars=200)
         actor.backend.tools=__import__('autoresearch_budget.contracts',fromlist=['actor_tools']).actor_tools()
         actor.backend.recorder=actor._record
@@ -90,6 +98,164 @@ class AdvisoryRuntimeTest(unittest.TestCase):
             if hasattr(advisor.backend,'primary'):
                 advisor.backend.primary.recorder=advisor.backend.fallback.recorder=agent._advisor_record
         return agent
+
+    def request(self, index, *, ids=None, **extra):
+        return response(index, name='request_advice', args={
+            'question':'Which hypothesis fits the observed failure?',
+            'evidence_ids':ids or ['observation-1'], 'state':STATE, **extra})
+
+    def finish(self, index, **extra):
+        return response(index, name='submit', args={'summary':'done', 'validation_refs':['observation-1'],
+                                                  'state':STATE, **extra})
+
+    def test_requested_policy_never_consults_automatically(self):
+        agent=self.agent([*[response(i) for i in range(1,26)],self.finish(26)],
+                         policy='advice_requested',max_calls=7)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,0)
+        self.assertTrue(all('request_advice' in {t['function']['name'] for t in r['tools']} for r in self.requests))
+        self.assertIn('7 maximum; 7 remaining', self.requests[0]['messages'][-1]['content'])
+        metadata=json.loads((agent.advice_store.run_dir/'metadata.json').read_text())
+        self.assertEqual(metadata['contract_version'],'phase2-v1')
+        self.assertNotIn('arrives every',agent.config.system_template)
+        self.assertIn('after initial inspection',self.requests[0]['messages'][0]['content'])
+        self.assertIn('If two checks fail',self.requests[0]['messages'][0]['content'])
+        self.assertIn('there is no minimum number of calls',self.requests[0]['messages'][0]['content'])
+
+    def test_requested_advice_matches_tool_response_and_tracks_followthrough(self):
+        agent=self.agent([response(1),self.request(2,ids=['observation-1','patch-1']),
+            response(3,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(4,advice_progress=[progress('advice-1','observation-3')])],
+            policy='advice_requested',max_calls=7)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.n_calls,4)
+        self.assertEqual(agent.advice_records['advice-1']['status'],'validated')
+        tools=[m for m in self.requests[2]['messages'] if m.get('tool_call_id')=='tool-2']
+        self.assertEqual(len(tools),1); self.assertEqual(tools[0]['role'],'tool')
+        self.assertIn('Advisor guidance (advice-1)',tools[0]['content'])
+        packet=next(e['payload']['packet'] for e in self.events(agent) if e['kind']=='advice_requested')
+        self.assertEqual(packet['question'],'Which hypothesis fits the observed failure?')
+        self.assertEqual(packet['actor_calls_remaining'],78)
+        self.assertEqual(set(packet['cited_evidence']),{'observation-1','patch-1'})
+        self.assertEqual([e['payload']['actor_call'] for e in self.events(agent) if e['kind']=='raw_observation'],[1,3])
+        self.assertIn('1 used / 7 maximum; 6 remaining', self.requests[2]['messages'][-1]['content'])
+
+    def test_requested_ceiling_denies_without_removing_tool(self):
+        reject={'advice_id':'advice-1','decision':'reject','reason':'Existing evidence rules it out',
+                'evidence_refs':['observation-1']}
+        agent=self.agent([response(1),self.request(2),response(3,args={'command':'true','state':STATE,
+            'advice_decision':reject}),self.request(4),self.finish(5)],policy='advice_requested',max_calls=1)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,1)
+        self.assertEqual(agent.advice_requests,2)
+        self.assertEqual(agent.advice_denials,{'call_limit':1})
+        self.assertIn('call_limit',next(m['content'] for m in self.requests[4]['messages'] if m.get('tool_call_id')=='tool-4'))
+        self.assertIn('request_advice',{t['function']['name'] for t in self.requests[4]['tools']})
+
+    def test_requested_production_template_formats_guidance_and_denial(self):
+        agent=self.agent([response(1),self.request(2),
+            response(3,args={'command':'touch unacknowledged','state':STATE}),
+            response(4,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.request(5,advice_progress=[progress('advice-1',None,status='in_progress')]),
+            self.finish(6,advice_progress=[progress('advice-1','observation-4')])],
+            policy='advice_requested',max_calls=1,production_template=True)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advice_denials,{'call_limit':1})
+        for index,call_id,expected in ((2,'tool-2','Advisor guidance (advice-1)'),(5,'tool-5','call_limit')):
+            tool=next(m for m in self.requests[index]['messages'] if m.get('tool_call_id')==call_id)
+            observation=json.loads(tool['content'])
+            self.assertEqual(observation['returncode'],0)
+            self.assertIn(expected,observation['output'])
+        self.assertIn('advice_decision for advice-1 is required', self.requests[3]['messages'][-2]['content'])
+        self.assertFalse((self.repo/'unacknowledged').exists())
+        self.assertEqual(agent.n_calls,6)
+        self.assertEqual(agent.advice_records['advice-1']['status'],'validated')
+
+    def test_requested_zero_limit_and_last_turn_do_not_dispatch(self):
+        for ceiling,limit,reason in ((0,3,'call_limit'),(7,2,'no_actor_capacity')):
+            with self.subTest(ceiling=ceiling,limit=limit):
+                actions=[response(1),self.request(2)]
+                if limit==3:actions.append(self.finish(3))
+                agent=self.agent(actions,policy='advice_requested',max_calls=ceiling,limit=limit)
+                self.assertEqual(agent.run('Issue')['exit_status'],'Submitted' if limit==3 else 'LimitsExceeded')
+                self.assertEqual(agent.advisor_calls,0)
+                self.assertEqual(agent.advice_denials,{reason:1})
+
+    def test_requested_unknown_evidence_and_pending_guidance_are_rejected(self):
+        agent=self.agent([response(1),self.request(2,ids=['observation-999']),
+            self.request(3,ids=['patch-999']),self.request(4),self.request(5),
+            response(6,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(7,advice_progress=[progress('advice-1','observation-6')])],policy='advice_requested')
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,1)
+        errors=[e['payload']['error'] for e in self.events(agent) if e['kind']=='actor_schema_error']
+        self.assertEqual(len(errors),3)
+        self.assertIn('unseen evidence',errors[0]); self.assertIn('pending guidance',errors[2])
+
+    def test_requested_followup_does_not_count_as_executed_advice_evidence(self):
+        agent=self.agent([response(1),self.request(2),
+            response(3,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.request(4,ids=['observation-3'],advice_progress=[progress('advice-1',None,status='in_progress')]),
+            response(5,args={'command':'true','state':STATE,'advice_decision':adopt('advice-2'),
+                            'advice_progress':[progress('advice-1','observation-3')]}),
+            self.finish(6,advice_progress=[progress('advice-2','observation-5')])],policy='advice_requested')
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,2)
+        self.assertEqual([a['actor_call'] for a in agent.advice_records['advice-1']['actions']],[3])
+        self.assertTrue(all(r['status']=='validated' for r in agent.advice_records.values()))
+
+    def test_requested_old_citation_uses_visible_output_not_elided_raw_output(self):
+        command="printf 'old-start'; printf '%0500d' 0; printf 'old-end'"
+        agent=self.agent([response(1,args={'command':command,'state':STATE}),
+            *[response(i,args={'command':"printf '%0500d' 1",'state':STATE}) for i in range(2,15)],
+            self.request(15),response(16,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(17,advice_progress=[progress('advice-1','observation-16')])],
+            policy='advice_requested',max_context_chars=2000)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        packet=next(e['payload']['packet'] for e in self.events(agent) if e['kind']=='advice_requested')
+        cited=packet['cited_evidence']['observation-1']
+        self.assertIn('old-start',cited); self.assertIn('omitted',cited)
+        self.assertNotIn('0'*200,cited)
+        self.assertLessEqual(len(json.dumps(packet,ensure_ascii=False)),2000)
+
+    def test_requested_fallback_is_one_consultation_and_failure_preserves_usage(self):
+        for fail in (False,True):
+            with self.subTest(fail=fail):
+                advisor=self.routed_advisor(fail_both=fail)
+                agent=self.agent([response(1),self.request(2),
+                    response(3,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+                    self.finish(4,advice_progress=[progress('advice-1','observation-3')])],
+                    policy='advice_requested',max_calls=1,advisor=advisor)
+                if fail:
+                    with self.assertRaises(AdvisorUnavailable):agent.run('Issue')
+                    self.assertEqual(agent.n_calls,2)
+                else:self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+                summary=json.loads((agent.advice_store.run_dir/'summary.json').read_text())
+                self.assertEqual(summary['advisor']['logical_calls'],1)
+                self.assertEqual(summary['advisor']['physical_api_calls'],2)
+                self.assertEqual(summary['advice_calls_remaining'],0)
+                self.assertEqual(summary['advisor']['observed_cost_usd'],'0.003' if fail else '0.023')
+
+    def test_requested_malformed_guidance_consumes_allowance_and_records_actor_cost(self):
+        agent=self.agent([response(1),self.request(2)],policy='advice_requested',max_calls=1,advisor_content='{}')
+        with self.assertRaises(AdvisorUnavailable):agent.run('Issue')
+        summary=json.loads((agent.advice_store.run_dir/'summary.json').read_text())
+        self.assertEqual(summary['advisor']['logical_calls'],1)
+        self.assertEqual(summary['advisor']['cost_usd'],'0.02')
+        self.assertEqual(summary['actor']['api_calls'],2)
+
+    def test_requested_expired_wall_time_denies_before_advisor_dispatch(self):
+        agent=self.agent([response(1),self.request(2)],policy='advice_requested',wall_time_limit_seconds=5)
+        transport=agent.model.backend.transport
+        def expired(request,timeout):
+            completion=transport(request,timeout)
+            if len(self.requests)==2:
+                agent._start_time=time.time()-10
+            return completion
+        agent.model.backend.transport=expired
+        self.assertEqual(agent.run('Issue')['exit_status'],'TimeExceeded')
+        self.assertEqual(agent.advice_denials,{'no_time_capacity':1})
+        self.assertEqual(agent.advisor_calls,0)
 
     def events(self, agent):
         return [json.loads(line) for line in agent.advice_store.events_path.read_text().splitlines()]

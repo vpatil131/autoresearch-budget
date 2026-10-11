@@ -19,6 +19,7 @@ from .runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, Tria
 from .store import RunStore
 from .batch import BatchRunner
 from .trial_pool import MAX_WORKERS, TrialPool, select_tasks
+from .advisor import POLICIES
 
 
 class _MockSandbox:
@@ -54,6 +55,17 @@ async def _mock_run(output: Path) -> dict[str, object]:
     return {"outcome": asdict(outcome), "commands": sandbox.commands}
 
 
+def _advice_arguments(command):
+    command.add_argument("--advice-policy", choices=sorted(POLICIES), help="override consultation policy")
+    command.add_argument("--max-advice-calls", type=int, help="maximum logical consultations per task attempt; zero disables dispatch")
+    command.add_argument("--advice-every-steps", type=int, help="actor-call interval; fixed_interval only")
+
+
+def _load_experiment(args):
+    return ExperimentConfig.load(args.config, project_root=Path.cwd()).with_consultation_overrides(
+        policy=args.advice_policy, max_calls=args.max_advice_calls, every_steps=args.advice_every_steps)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autoresearch-budget")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -80,13 +92,14 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--workers", type=int, choices=range(1, MAX_WORKERS + 1), default=1)
         command.add_argument("--env-file", default=".env")
         command.add_argument("--attempt", type=int, default=1)
+        _advice_arguments(command)
 
     probe = commands.add_parser("probe", help="run one low-cost model probe")
     probe.add_argument("--config", type=Path, required=True)
     probe.add_argument("--profile", required=True)
     probe.add_argument("--max-cost-usd", type=Decimal, required=True)
     probe.add_argument("--max-tokens", type=int, default=128)
-    batch = commands.add_parser("batch", help="preview or execute the phase 1 task cohort")
+    batch = commands.add_parser("batch", help="preview or execute an advisor experiment cohort")
     batch_commands = batch.add_subparsers(dest="batch_command", required=True)
     for name in ("plan", "run"):
         command = batch_commands.add_parser(name)
@@ -95,6 +108,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--profile", default="small")
         command.add_argument("--concurrency", type=int, default=4)
         command.add_argument("--env-file", default=".env")
+        _advice_arguments(command)
     status = batch_commands.add_parser("status", help="read progress for every active task")
     status.add_argument("--batch-dir", type=Path, required=True)
     status.add_argument("--live", action="store_true", help="also read live advice logs via Docker")
@@ -109,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
                 from .batch_monitor import snapshot
                 print(json.dumps(snapshot(args.batch_dir, live=args.live), indent=2))
                 return 0
-            config = ExperimentConfig.load(args.config, project_root=Path.cwd())
+            config = _load_experiment(args)
             runner = BatchRunner(config, args.batch_dir, profile=args.profile,
                                  concurrency=args.concurrency, env_file=args.env_file)
             if args.batch_command == "plan":
@@ -139,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "trial":
         try:
-            config = ExperimentConfig.load(args.config, project_root=Path.cwd())
+            config = _load_experiment(args)
             runner = HarborTrialRunner(config)
             tasks = select_tasks(args.task_id, args.task_manifest)
             specs = [TrialSpec(task, args.profile, args.attempt) for task in tasks]

@@ -7,7 +7,8 @@ import os
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,32 @@ class ExperimentConfig:
     paid_inference_enabled: bool
     budget_enforced: bool = True
     consultation: dict[str, Any] = field(default_factory=dict)
+    source_config: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def resolved_config(self) -> dict:
+        raw = deepcopy(self.source_config or json.loads(self.path.read_text()))
+        if self.consultation or "consultation" in raw:
+            raw["consultation"] = deepcopy(self.consultation)
+        return raw
+
+    def with_consultation_overrides(self, *, policy=None, max_calls=None, every_steps=None) -> "ExperimentConfig":
+        if policy is None and max_calls is None and every_steps is None:
+            return self
+        if self.agent.get("scaffold") != "mini-swe-advisor":
+            raise RunnerConfigError("advice overrides require mini-swe-advisor")
+        consultation = dict(self.consultation)
+        if policy is not None:
+            consultation["policy"] = policy
+        if max_calls is not None:
+            consultation["max_calls"] = max_calls
+        if consultation.get("policy", "fixed_interval") != "fixed_interval":
+            if every_steps is not None:
+                raise RunnerConfigError("--advice-every-steps applies only to fixed_interval")
+            consultation.pop("every_steps", None)
+        elif every_steps is not None:
+            consultation["every_steps"] = every_steps
+        AdvicePolicy.load(consultation)
+        return replace(self, consultation=consultation)
 
     @classmethod
     def load(cls, path: str | Path, *, project_root: str | Path) -> "ExperimentConfig":
@@ -82,6 +109,7 @@ class ExperimentConfig:
             paid_inference_enabled=bool(raw.get("paid_inference_enabled", False)),
             budget_enforced=bool(budget.get("enforce", True)),
             consultation=dict(raw.get("consultation", {})),
+            source_config=raw,
         )
 
 
@@ -243,9 +271,9 @@ class HarborTrialRunner:
         if self.config.budget_enforced:
             raise RunnerConfigError("the advisory POC requires budget.enforce=false")
         if str(self.config.agent.get("version", "")) != "2.4.6":
-            raise RunnerConfigError("phase 1 requires mini-SWE-agent 2.4.6")
+            raise RunnerConfigError("the advisory POC requires mini-SWE-agent 2.4.6")
         if int(self.config.agent.get("max_steps", 0)) < 1:
-            raise RunnerConfigError("phase 1 requires a positive actor call allowance")
+            raise RunnerConfigError("the advisory POC requires a positive actor call allowance")
         try:
             AdvicePolicy.load(self.config.consultation)
         except (TypeError, ValueError) as error:
@@ -280,7 +308,7 @@ class HarborTrialRunner:
             "task_id": spec.task_id, "profile": spec.profile,
             "consultation": self.config.consultation, "budget_enforced": False,
             "actor_max_steps": int(self.config.agent["max_steps"]),
-            "configuration": json.loads(self.config.path.read_text()),
+            "configuration": self.config.resolved_config(),
             "harbor_command": self.command(spec, task_dir=task_dir),
         })
         for filename in ("task.toml", "instruction.md"):
@@ -366,7 +394,11 @@ class HarborTrialRunner:
     def _job_name(self, spec: TrialSpec) -> str:
         if self._scaffold() == self.ADVISORY_SCAFFOLD:
             policy = AdvicePolicy.load(self.config.consultation)
+            if policy.policy == "advice_requested":
+                return f"phase2-advice_requested-m{policy.max_calls}-{spec.profile}-{spec.task_id}-a{spec.attempt}"
             condition = f"{policy.policy}-k{policy.every_steps}" if policy.policy == "fixed_interval" else "actor_only"
+            if policy.policy == "fixed_interval" and policy.max_calls != 100:
+                condition += f"-m{policy.max_calls}"
             return f"phase1-{condition}-{spec.profile}-{spec.task_id}-a{spec.attempt}"
         return f"{spec.profile}-{spec.task_id}-a{spec.attempt}"
 

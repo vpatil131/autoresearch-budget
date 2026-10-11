@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from autoresearch_budget.batch import BatchRunner, append, coordinator_lock, read_lines
 from autoresearch_budget.cli import main
-from autoresearch_budget.runner import ExperimentConfig, RunnerConfigError
+from autoresearch_budget.runner import ExperimentConfig, RunnerConfigError, TrialSpec
 
 
 class BatchTest(unittest.TestCase):
@@ -202,6 +202,52 @@ class BatchTest(unittest.TestCase):
                 with self.assertRaises(RunnerConfigError):self.batch(config, concurrency=count)
             (config.task_root/'owner__repo-0/instruction.md').unlink()
             with self.assertRaises(RunnerConfigError):self.batch(config)
+
+    def test_requested_policy_cli_overrides_freeze_and_resume_exact_settings(self):
+        with TemporaryDirectory() as temp:
+            root=Path(temp); config=self.config(root,count=1)
+            batch_dir=config.jobs_root/'_batch/requested'
+            argv=['batch','run','--config',str(config.path),'--batch-dir',str(batch_dir),
+                  '--advice-policy','advice_requested','--max-advice-calls','3']
+            seen=[]
+            def execute(runner,claim,source):
+                frozen=ExperimentConfig.load(batch_dir/'config.json',project_root=root)
+                settings=json.loads(next(a[7:] for a in runner.runner.command(
+                    TrialSpec(claim['task_id'],'small'))
+                    if a.startswith('config=')))
+                seen.append(settings['agent']['advice'])
+                self.assertEqual(frozen.consultation['policy'],'advice_requested')
+                self.assertEqual(frozen.consultation['max_calls'],3)
+                self.assertNotIn('every_steps',frozen.consultation)
+                return self.outcome(claim)
+            with patch('pathlib.Path.cwd',return_value=root), patch.object(BatchRunner,'_execute',execute):
+                self.assertEqual(main(argv),0)
+                self.assertEqual(main(argv),0)
+                with patch('builtins.print'):
+                    self.assertEqual(main([*argv[:-1],'4']),2)
+            self.assertEqual(len(seen),1)
+            self.assertEqual(seen[0]['max_calls'],3)
+            records=read_lines(batch_dir/'attempts.jsonl')
+            self.assertTrue(records[0]['job_name'].startswith('phase2-advice_requested-m3-'))
+            metadata=json.loads((batch_dir/'metadata.json').read_text())
+            self.assertEqual(metadata['config']['consultation']['max_calls'],3)
+            self.assertEqual(json.loads(config.path.read_text())['consultation']['policy'],'fixed_interval')
+
+    def test_requested_and_actor_only_batch_plans_and_invalid_overrides_are_read_only(self):
+        with TemporaryDirectory() as temp:
+            root=Path(temp); config=self.config(root,count=1,paid=False)
+            for policy in ('advice_requested','actor_only'):
+                resolved=config.with_consultation_overrides(policy=policy,max_calls=0)
+                plan=self.batch(resolved).plan()
+                self.assertEqual(plan['policy'],policy)
+                self.assertEqual(plan['max_advice_calls'],0)
+                self.assertIsNone(plan['every_steps'])
+            for flags in (['--max-advice-calls','-1'],
+                          ['--advice-policy','advice_requested','--advice-every-steps','10']):
+                with patch('pathlib.Path.cwd',return_value=root), patch('builtins.print'), \
+                     patch.object(BatchRunner,'run',side_effect=AssertionError('no dispatch')):
+                    self.assertEqual(main(['batch','run','--config',str(config.path),'--batch-dir',str(root/'batch'),*flags]),2)
+            self.assertFalse((root/'batch').exists())
 
     def test_worker_exception_is_journaled_without_exposing_exception_payload(self):
         with TemporaryDirectory() as temp:

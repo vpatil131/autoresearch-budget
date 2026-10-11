@@ -1,4 +1,4 @@
-"""mini-SWE 2.4.6 controller for the fixed-interval advisor proof of concept."""
+"""mini-SWE 2.4.6 controller for scheduled and actor-requested advice."""
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +14,7 @@ from minisweagent.agents.default import DefaultAgent
 from minisweagent.exceptions import FormatError, Submitted
 
 from .advisor import AdvicePolicy, Advisor, AdvisorUnavailable, SCHEDULED_QUESTION, actor_usage, advice_packet, amount
-from .contracts import ACTOR_INSTANCE, ACTOR_SYSTEM, CONTRACT_VERSION, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
+from .contracts import CONTRACT_VERSION, PHASE2_CONTRACT_VERSION, actor_prompts, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
 from .models import ModelError, RequestOutcomeUnknown
 from .store import RunStore
 
@@ -38,8 +38,8 @@ class AdvisoryAgent(DefaultAgent):
         self.max_observation_chars = max_observation_chars
         # The builtin mini prompt assumes bash and a shell submission sentinel.
         # Replace both prompt templates so they agree with the native tools.
-        kwargs["system_template"] = ACTOR_SYSTEM.replace("every 10", f"every {self.policy.every_steps}")
-        kwargs["instance_template"] = ACTOR_INSTANCE
+        kwargs["system_template"], kwargs["instance_template"] = actor_prompts(
+            self.policy.policy, self.policy.every_steps, self.policy.max_calls)
         super().__init__(model, env, **kwargs)
         if self.config.cost_limit != 0:
             raise ValueError("The advisory POC requires cost_limit=0; dollar enforcement is deferred")
@@ -56,6 +56,11 @@ class AdvisoryAgent(DefaultAgent):
         self.advice_records: dict[str, dict] = {}
         self.state = {}
         self.observation_ids: set[str] = set()
+        self.visible_evidence: dict[str, str] = {}
+        self.visible_patch_ids: set[str] = set()
+        self.patch_evidence: dict[str, str] = {}
+        self.advice_requests = 0
+        self.advice_denials: dict[str, int] = {}
         self.patch_id = None
         self.patch_text = ""
         self.patch_hash = None
@@ -67,7 +72,9 @@ class AdvisoryAgent(DefaultAgent):
         if hasattr(env, "bind"):
             env.bind(self.advice_store, lambda: self.n_calls)
         self.advice_store.write_metadata({
-            "contract_version": CONTRACT_VERSION, "policy": self.policy.__dict__,
+            "contract_version": PHASE2_CONTRACT_VERSION if self.policy.policy == "advice_requested" else CONTRACT_VERSION,
+            "policy": {key: value for key, value in self.policy.__dict__.items()
+                       if key != "every_steps" or self.policy.policy == "fixed_interval"},
             "advisor": self.advisor_profile, "budget_enforced": False,
             "hidden_verifier_feedback": False, "agent_config": self.config.model_dump(mode="json"),
             "model_config": model.serialize(), "environment_config": env.serialize(),
@@ -118,7 +125,21 @@ class AdvisoryAgent(DefaultAgent):
         self.model.pending_advice = self.pending_advice
         self.model.advice_records = self.advice_records
         self.model.observation_ids = self.observation_ids
+        self.model.patch_ids = self.visible_patch_ids
+        self.model.advice_enabled = self.policy.policy == "advice_requested"
+        if self.policy.policy == "advice_requested":
+            self.add_messages(self.model.format_message(role="user", content=self._capacity_status()))
         return super().query()
+
+    def _capacity_status(self):
+        remaining = max(0, self.config.step_limit - self.n_calls) if self.config.step_limit else "unlimited"
+        return (f"Actor calls remaining: {remaining}\nAdvisor consultations: {self.advisor_calls} used / "
+                f"{self.policy.max_calls} maximum; {max(0, self.policy.max_calls - self.advisor_calls)} remaining")
+
+    def _deny_advice(self, reason):
+        self.advice_denials[reason] = self.advice_denials.get(reason, 0) + 1
+        self.advice_store.append_event("advice_denied", {"actor_call": self.n_calls, "reason": reason})
+        return f"Advice unavailable ({reason}); continue independently."
 
     def execute_actions(self, message):
         actions = message.get("extra", {}).get("actions", [])
@@ -126,10 +147,11 @@ class AdvisoryAgent(DefaultAgent):
             if len(actions) != 1:
                 raise ValueError("Exactly one native action is required")
             action = actions[0]
-            validate_action(action["name"], {key: value for key, value in action.items() if key not in {"name", "tool_call_id"}})
+            validate_action(action["name"], {key: value for key, value in action.items() if key not in {"name", "tool_call_id"}},
+                            advice_enabled=self.policy.policy == "advice_requested")
             decision = action.get("advice_decision")
             validate_advice_context(action, pending_advice=self.pending_advice,
-                                   records=self.advice_records, observation_ids=self.observation_ids)
+                                   records=self.advice_records, observation_ids=self.observation_ids, patch_ids=self.visible_patch_ids)
         except (ValueError, KeyError, TypeError) as error:
             self.advice_store.append_event("actor_schema_error", {"actor_call": self.n_calls, "error": str(error)})
             # A parsed assistant tool call is already in the transcript; close it
@@ -150,6 +172,21 @@ class AdvisoryAgent(DefaultAgent):
             record = self.advice_records[progress["advice_id"]]
             record.update(status=progress["status"], progress=progress)
             self._advice_status(record)
+        if action["name"] == "request_advice":
+            self.advice_requests += 1
+            self.advice_store.append_event("actor_advice_request", {"actor_call": self.n_calls,
+                "question": action["question"], "evidence_ids": action["evidence_ids"]})
+            if self.config.step_limit and self.n_calls >= self.config.step_limit:
+                guidance = self._deny_advice("no_actor_capacity")
+            elif self.config.wall_time_limit_seconds and time.time() - self._start_time >= self.config.wall_time_limit_seconds:
+                guidance = self._deny_advice("no_time_capacity")
+            else:
+                guidance = self._consult(question=action["question"], reason="advice_requested",
+                    evidence_ids=action["evidence_ids"])
+            observations = self.model.format_observation_messages(message,
+                [{"output": guidance, "returncode": 0, "exception_info": ""}],
+                self.get_template_vars())
+            return self.add_messages(*observations)
         if action["name"] == "submit":
             self.advice_store.append_event("submission", {"actor_call": self.n_calls,
                 "summary": action["summary"], "validation_refs": action["validation_refs"], "patch_id": self.patch_id})
@@ -177,6 +214,10 @@ class AdvisoryAgent(DefaultAgent):
         visible["extra"] = {"observation_id": observation_id, "patch_id": self.patch_id,
                             "output_truncated": len(text) > self.max_observation_chars}
         visible = self.advice_store.redact(visible)
+        self.visible_patch_ids.add(self.patch_id)
+        self.visible_evidence[observation_id] = (
+            f"returncode={visible.get('returncode')}; exception_info={visible.get('exception_info', '')}; "
+            f"output_truncated={len(text) > self.max_observation_chars}\n{visible.get('output', '')}")
         observations = self.model.format_observation_messages(message, [visible], self.get_template_vars())
         # Advertise the evidence ID without changing the saved raw command output.
         for observation in observations:
@@ -205,6 +246,7 @@ class AdvisoryAgent(DefaultAgent):
             self.patch_number += 1
             self.patch_id = f"patch-{self.patch_number}"
             self.patch_text, self.patch_hash = text, digest
+            self.patch_evidence[self.patch_id] = self.advice_store.redact(text)
             artifact = self.advice_store.write_artifact(self.patch_id, {"patch": text, "sha256": digest})
             self.advice_store.append_event("patch_snapshot", {"actor_call": self.n_calls,
                 "patch_id": self.patch_id, "reason": reason, "artifact": artifact, "sha256": digest})
@@ -234,21 +276,27 @@ class AdvisoryAgent(DefaultAgent):
             self.advisor_prompt_tokens += int(usage.get("prompt_tokens") or 0)
             self.advisor_completion_tokens += int(usage.get("completion_tokens") or 0)
 
-    def _consult(self):
+    def _consult(self, *, question=SCHEDULED_QUESTION, reason="fixed_interval", evidence_ids=()):
         if self.advisor_calls >= self.policy.max_calls:
-            self.advice_store.append_event("advice_denied", {"actor_call": self.n_calls, "reason": "call_limit"})
-            return "Advisor call ceiling reached. Continue independently."
-        packet = advice_packet(task=self.extra_template_vars.get("task", ""), messages=self.messages,
-            diff=self.patch_text, question=SCHEDULED_QUESTION, actor_calls=self.n_calls,
-            actor_limit=self.config.step_limit, max_chars=self.policy.max_context_chars,
-            state=self.state, patch_id=self.patch_id,
-            followthrough=list(self.advice_records.values()))
+            return self._deny_advice("call_limit")
+        cited = {ref: self.visible_evidence[ref] if ref in self.visible_evidence else self.patch_evidence[ref]
+                 for ref in evidence_ids}
+        try:
+            packet = advice_packet(task=self.extra_template_vars.get("task", ""), messages=self.messages,
+                diff=self.patch_text, question=question, actor_calls=self.n_calls,
+                actor_limit=self.config.step_limit, max_chars=self.policy.max_context_chars,
+                state=self.state, patch_id=self.patch_id, reason=reason, cited_evidence=cited,
+                advice_calls_remaining=self.policy.max_calls - self.advisor_calls - 1,
+                followthrough=list(self.advice_records.values()))
+        except ValueError:
+            return self._deny_advice("context_limit")
         packet = self.advice_store.redact(packet)
         self.advisor_calls += 1
         advice_id = f"advice-{self.advisor_calls}"
         request_id = f"{self.advice_store.run_id}:{advice_id}"
         self.advice_store.append_event("advice_requested", {"actor_call": self.n_calls,
-            "advice_id": advice_id, "request_id": request_id, "packet": packet})
+            "advice_id": advice_id, "request_id": request_id, "reason": reason,
+            "evidence_ids": list(evidence_ids), "packet": packet})
         started = time.monotonic()
         try:
             if self.advisor is None:
@@ -297,7 +345,10 @@ class AdvisoryAgent(DefaultAgent):
             "prompt_tokens": self.advisor_prompt_tokens, "completion_tokens": self.advisor_completion_tokens}
         total = str(Decimal(actor["cost_usd"]) + Decimal(advisor["cost_usd"])) if actor["cost_usd"] is not None and advisor["cost_usd"] is not None else None
         metrics = {"run_id": self.advice_store.run_id, "policy": self.policy.policy,
-            "every_steps": self.policy.every_steps, "budget_enforced": False,
+            "every_steps": self.policy.every_steps if self.policy.policy == "fixed_interval" else None,
+            "max_advice_calls": self.policy.max_calls, "advice_requests": self.advice_requests,
+            "advice_calls_remaining": max(0, self.policy.max_calls - self.advisor_calls),
+            "advice_denials": self.advice_denials, "budget_enforced": False,
             "actor": actor, "advisor": advisor, "total_cost_usd": total,
             "stop_reason": data["info"].get("exit_status"), "final_patch_id": self.patch_id,
             "duration_seconds": time.monotonic() - self.started}

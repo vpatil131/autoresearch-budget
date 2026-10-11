@@ -1,4 +1,4 @@
-"""Read-only snapshots of every active phase 1 task, including live containers."""
+"""Read-only snapshots of every active advisor task, including live containers."""
 from collections import Counter
 import inspect
 import json
@@ -13,6 +13,8 @@ def summarize(summary, events):
     routes = Counter()
     checkpoints = []
     decisions = []
+    requests = []
+    denials = Counter()
     latest = None
     contiguous = True
     for index, line in enumerate(events, 1):
@@ -27,7 +29,12 @@ def summarize(summary, events):
         latest = {k: event.get(k) for k in ('kind', 'timestamp', 'sequence')}
         payload = event.get('payload', {})
         if event['kind'] == 'advice_requested':
-            checkpoints.append(payload.get('actor_call'))
+            if payload.get('reason', 'fixed_interval') == 'fixed_interval':
+                checkpoints.append(payload.get('actor_call'))
+        if event['kind'] == 'actor_advice_request':
+            requests.append({k: payload.get(k) for k in ('actor_call', 'question', 'evidence_ids')})
+        if event['kind'] == 'advice_denied':
+            denials[payload.get('reason')] += 1
         if event['kind'] == 'advice_decision':
             decisions.append({k: payload.get(k) for k in ('actor_call', 'advice_id', 'decision')})
         if event['kind'] == 'model_response':
@@ -38,7 +45,12 @@ def summarize(summary, events):
                 except ValueError:
                     body = {}
             routes[(payload.get('model_role'), body.get('provider'), body.get('service_tier'))] += 1
+    ceiling = summary.get('max_advice_calls')
+    used = counts['advice_requested']
     return {'summary': summary, 'latest_activity': latest, 'checkpoints': checkpoints,
+            'advice_requests': requests, 'advice_dispatched': used,
+            'advice_delivered': counts['advice_delivered'], 'advice_denials': dict(denials),
+            'advice_calls_remaining': max(0, ceiling - used) if ceiling is not None else None,
             'decisions': decisions, 'event_sequence_contiguous': contiguous,
             'routes': [{'role': role, 'provider': provider, 'service_tier': tier, 'responses': n}
                        for (role, provider, tier), n in routes.items()],

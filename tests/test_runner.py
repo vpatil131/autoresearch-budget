@@ -224,6 +224,26 @@ class HarborTrialRunnerTest(unittest.TestCase):
         self.assertFalse(config.paid_inference_enabled)
         self.assertFalse(config.budget_enforced)
 
+    def test_phase2_config_and_cli_override_are_carried_into_trial_commands(self):
+        from autoresearch_budget.cli import main
+        root=Path(__file__).resolve().parents[1]
+        config=ExperimentConfig.load(root/'config/experiment.phase2.json',project_root=root)
+        self.assertEqual(config.consultation['max_calls'],7)
+        self.assertEqual(config.consultation['policy'],'advice_requested')
+        self.assertNotIn('every_steps',config.consultation)
+        self.assertFalse(config.paid_inference_enabled)
+        with patch('builtins.print') as output, patch('pathlib.Path.cwd',return_value=root):
+            self.assertEqual(main(['trial','plan','--config',str(config.path),'--profile','small',
+                '--task-id','gotd__td-1759','--max-advice-calls','2']),0)
+        import shlex
+        command=shlex.split(output.call_args.args[0])
+        settings=json.loads(next(a[7:] for a in command if a.startswith('config=')))
+        self.assertEqual(settings['agent']['advice']['max_calls'],2)
+        self.assertEqual(settings['agent']['advice']['policy'],'advice_requested')
+        self.assertTrue(settings['agent']['advice']['run_id'].startswith('phase2-advice_requested-m2-'))
+        self.assertNotIn('every_steps',settings['agent']['advice'])
+        self.assertEqual(settings['agent']['advice']['advisor']['fallback']['provider']['only'],['azure'])
+
     def test_poc_retains_grading_after_run_without_budget_ledger_or_overwrites(self):
         with TemporaryDirectory() as temp:
             root=Path(temp); config=self._poc_config(root,paid=True)
@@ -260,6 +280,16 @@ class HarborTrialRunnerTest(unittest.TestCase):
                 with self.assertRaises(RunnerConfigError):
                     runner.run(spec)
             self.assertNotEqual(runner._job_name(spec),runner._job_name(TrialSpec("owner__repo-1","small",2)))
+            # Execute the requested-advice condition through the same runner and
+            # verify metadata records the override rather than rereading phase 1.
+            config=config.with_consultation_overrides(policy='advice_requested',max_calls=2)
+            runner=HarborTrialRunner(config); job=runner._job_name(spec)
+            with patch('subprocess.run',side_effect=completed):
+                self.assertEqual(runner.run(spec),0)
+            metadata=json.loads((config.jobs_root/'_poc_records'/job/'metadata.json').read_text())
+            self.assertEqual(metadata['configuration']['consultation']['max_calls'],2)
+            self.assertEqual(metadata['configuration']['consultation']['policy'],'advice_requested')
+            self.assertNotIn('every_steps',metadata['configuration']['consultation'])
 
     def test_completed_job_cost_rejects_unfinished_result(self):
         with TemporaryDirectory() as temp:

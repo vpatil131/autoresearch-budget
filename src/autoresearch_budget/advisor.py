@@ -11,7 +11,7 @@ from typing import Any
 from .models import Completion, CompletionBackend, FallbackClient, ModelError, OpenRouterClient
 
 
-POLICIES = {"actor_only", "fixed_interval"}
+POLICIES = {"actor_only", "fixed_interval", "advice_requested"}
 SCHEDULED_QUESTION = ("Review the current approach, identify the most consequential gap, "
                       "and recommend a concrete next action with a way to validate it.")
 ADVISOR_SYSTEM = """You advise a small software engineering actor on a SWE-rebench task.
@@ -25,6 +25,11 @@ concrete uncertainty and a falsifiable next action; do not claim verified succes
 Review advice_followthrough when present: distinguish acknowledgment from actual
 execution and validation. Identify unfinished recommendations or unsupported
 claims using recorded commands and public observations. Recommend the next step.
+"""
+REQUESTED_ADVISOR_SYSTEM = ADVISOR_SYSTEM + """This consultation was requested by the actor.
+Answer its focused question using cited_evidence and the current context.
+If evidence is insufficient, identify what is missing and recommend a concrete
+check. Distinguish observations from assumptions.
 """
 
 
@@ -61,11 +66,14 @@ class AdvicePolicy:
     def load(cls, value: dict[str, Any]) -> "AdvicePolicy":
         config = cls(**{key: value[key] for key in cls.__dataclass_fields__ if key in value})
         if config.policy not in POLICIES:
-            raise ValueError("phase 1 supports actor_only or fixed_interval; on-demand and hybrid are deferred")
+            raise ValueError(f"policy must be one of {sorted(POLICIES)}")
+        if config.policy != "fixed_interval" and "every_steps" in value:
+            raise ValueError("every_steps applies only to fixed_interval")
         for key in ("every_steps", "max_calls", "max_context_chars", "max_output_tokens"):
             number = getattr(config, key)
-            if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-                raise ValueError(f"{key} must be a positive integer")
+            minimum = 0 if key == "max_calls" else 1
+            if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
+                raise ValueError(f"{key} must be an integer >= {minimum}")
         if config.max_context_chars < 1000:
             raise ValueError("max_context_chars must be at least 1000")
         return config
@@ -118,6 +126,8 @@ def advice_packet(
     actor_calls: int, actor_limit: int, max_chars: int,
     state: dict | None = None, patch_id: str | None = None,
     followthrough: list[dict] | None = None,
+    reason: str = "fixed_interval", cited_evidence: dict[str, str] | None = None,
+    advice_calls_remaining: int | None = None,
 ) -> dict[str, Any]:
     """Bound model-visible public evidence, retaining excerpts of large observations."""
     if max_chars < 1000:
@@ -138,7 +148,7 @@ def advice_packet(
     packet: dict[str, Any] = {
         "goal": clip(task, max_chars // 6),
         "question": clip(question, max_chars // 10),
-        "reason": "fixed_interval",
+        "reason": reason,
         "actor_state": current_state,
         "actor_calls": actor_calls,
         "actor_calls_remaining": max(0, actor_limit - actor_calls) if actor_limit else None,
@@ -149,6 +159,12 @@ def advice_packet(
         # Reserve bounded space for advice history instead of silently letting
         # growing command records displace the entire packet.
         packet["advice_followthrough"] = clip(json.dumps(followthrough, ensure_ascii=False), max_chars // 4)
+    if cited_evidence:
+        # Cited evidence takes priority over the recent transcript, and is sourced
+        # from exactly what the actor saw, never the longer raw command output.
+        allowance = max_chars // 4 // len(cited_evidence)
+        packet["cited_evidence"] = {key: clip(value, allowance) for key, value in cited_evidence.items()}
+        packet["advice_calls_remaining"] = advice_calls_remaining
     # Escape-heavy strings can expand beyond the initial character allocation.
     while len(json.dumps(packet, ensure_ascii=False)) > max_chars - 250:
         choices = [(packet, "goal"), (packet, "question"), (packet["current_patch"], "diff")]
@@ -156,11 +172,15 @@ def advice_packet(
             choices.append((packet, "advice_followthrough"))
         if "hypothesis" in current_state:
             choices.append((current_state, "hypothesis"))
+        if cited_evidence:
+            choices.extend((packet["cited_evidence"], key) for key in cited_evidence)
         obj, key = max(choices, key=lambda item: len(item[0][item[1]]))
         if not obj[key]:
             break
         obj[key] = obj[key][:len(obj[key]) // 2]
         truncated = True
+    if len(json.dumps(packet, ensure_ascii=False)) > max_chars:
+        raise ValueError("Evidence IDs and packet metadata exceed the advisor context limit")
     selected = []
     for message in reversed(messages):
         if message.get("role") not in {"assistant", "tool", "user"}:
@@ -222,7 +242,7 @@ class Advisor:
 
     def consult(self, packet: dict[str, Any], request_id: str) -> Completion:
         return asyncio.run(self.backend.complete(
-            [{"role": "system", "content": ADVISOR_SYSTEM},
+            [{"role": "system", "content": REQUESTED_ADVISOR_SYSTEM if packet.get("reason") == "advice_requested" else ADVISOR_SYSTEM},
              {"role": "user", "content": json.dumps(packet, ensure_ascii=False)}],
             request_id=request_id, max_tokens=self.max_tokens,
         ))
