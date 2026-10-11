@@ -17,6 +17,7 @@ from .store import RunStore
 from .advisor import AdvicePolicy
 
 VALID_STOPS = {"Submitted", "LimitsExceeded", "TimeExceeded", "RepeatedFormatError"}
+MAX_CONCURRENCY = 6
 
 
 def now() -> str:
@@ -69,8 +70,8 @@ class BatchRunner:
         self.env_file = env_file
         self.runner = HarborTrialRunner(config)
         self.execute = execute or self._execute
-        if concurrency not in range(1, 5):
-            raise RunnerConfigError("batch concurrency must be between 1 and 4")
+        if concurrency not in range(1, MAX_CONCURRENCY + 1):
+            raise RunnerConfigError(f"batch concurrency must be between 1 and {MAX_CONCURRENCY}")
         if config.agent.get("scaffold") != "mini-swe-advisor":
             raise RunnerConfigError("batch execution requires mini-swe-advisor")
         self.policy = AdvicePolicy.load(config.consultation)

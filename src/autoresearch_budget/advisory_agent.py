@@ -71,6 +71,8 @@ class AdvisoryAgent(DefaultAgent):
             model.bind(self.advice_store)
         if hasattr(env, "bind"):
             env.bind(self.advice_store, lambda: self.n_calls)
+        if hasattr(env, "set_time_remaining"):
+            env.set_time_remaining(self._command_time_remaining)
         self.advice_store.write_metadata({
             "contract_version": PHASE2_CONTRACT_VERSION if self.policy.policy == "advice_requested" else CONTRACT_VERSION,
             "policy": {key: value for key, value in self.policy.__dict__.items()
@@ -80,6 +82,11 @@ class AdvisoryAgent(DefaultAgent):
             "model_config": model.serialize(), "environment_config": env.serialize(),
             "max_observation_chars": max_observation_chars,
         })
+
+    def _command_time_remaining(self):
+        if not self.config.wall_time_limit_seconds:
+            return None
+        return self.config.wall_time_limit_seconds - (time.time() - self._start_time)
 
     def add_messages(self, *messages):
         for message in messages:
@@ -193,7 +200,8 @@ class AdvisoryAgent(DefaultAgent):
             raise Submitted({"role": "exit", "content": action["summary"],
                              "extra": {"exit_status": "Submitted", "submission": action["summary"]}})
         observation_id = f"observation-{self.n_calls}"
-        output = self.env.execute({"command": action["command"], "observation_id": observation_id})
+        output = self.env.execute({"command": action["command"], "observation_id": observation_id,
+                                   "patch_id": self.patch_id})
         # The environment records the complete combined stdout/stderr and return code.
         self.advice_store.append_event("raw_observation", {"actor_call": self.n_calls,
             "observation_id": observation_id, "result": output})

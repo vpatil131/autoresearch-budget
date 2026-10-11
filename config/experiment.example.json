@@ -12,7 +12,7 @@
     "version": "2.4.6",
     "max_steps": 80,
     "max_tokens_per_call": 4096,
-    "command_timeout_sec": 120,
+    "command_timeout_sec": 600,
     "max_observation_chars": 20000
   },
   "profiles": {

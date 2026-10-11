@@ -108,6 +108,22 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         return response(index, name='submit', args={'summary':'done', 'validation_refs':['observation-1'],
                                                   'state':STATE, **extra})
 
+    def test_command_deadline_is_bound_to_agent_wall_time(self):
+        agent=self.agent([response(1)],wall_time_limit_seconds=5)
+        agent._start_time=time.time()-6
+        output=agent.env.execute({'command':'touch deadline-overrun'})
+        self.assertTrue(output['timed_out'])
+        self.assertFalse((self.repo/'deadline-overrun').exists())
+
+    def test_command_record_identifies_patch_at_launch(self):
+        agent=self.agent([response(1),self.finish(2)],policy='actor_only')
+        agent.run('Offline task')
+        commands=[json.loads(line)['payload'] for line in agent.advice_store.events_path.read_text().splitlines()
+                  if json.loads(line)['kind']=='command']
+        command=next(record for record in commands if record['observation_id']=='observation-1')
+        self.assertEqual(command['patch_id'],'patch-1')
+        self.assertFalse(command['timed_out'])
+
     def test_requested_policy_never_consults_automatically(self):
         agent=self.agent([*[response(i) for i in range(1,26)],self.finish(26)],
                          policy='advice_requested',max_calls=7)

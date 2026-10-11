@@ -59,11 +59,11 @@ class BatchTest(unittest.TestCase):
             self.assertEqual(before, sorted(str(p.relative_to(root)) for p in root.rglob('*')))
             with self.assertRaises(RunnerConfigError):runner.run()
 
-    def test_four_concurrent_real_runners_preserve_isolated_logs_and_configuration(self):
+    def test_six_concurrent_real_runners_preserve_isolated_logs_and_configuration(self):
         with TemporaryDirectory() as temp:
-            root = Path(temp); config = self.config(root)
-            runner = self.batch(config)
-            barrier = threading.Barrier(4)
+            root = Path(temp); config = self.config(root, count=12)
+            runner = self.batch(config, concurrency=6)
+            barrier = threading.Barrier(6)
             mutex = threading.Lock(); running = 0; peak = 0; seen = []
             def harbor(command, **kwargs):
                 nonlocal running, peak
@@ -79,7 +79,7 @@ class BatchTest(unittest.TestCase):
                 with mutex:
                     running += 1; peak = max(peak, running); seen.append(job)
                 barrier.wait(timeout=5)
-                time.sleep(0.005 * (int(job.split('repo-')[1].split('-')[0]) % 4))
+                time.sleep(0.005 * (int(job.split('repo-')[1].split('-')[0]) % 6))
                 trial = config.jobs_root / job / 'trial'
                 (trial / 'agent/advice/artifacts').mkdir(parents=True)
                 (trial / 'verifier').mkdir()
@@ -96,12 +96,12 @@ class BatchTest(unittest.TestCase):
                 return type('Result', (), {'returncode': 0})()
             with patch('subprocess.run', side_effect=harbor):
                 self.assertEqual(runner.run(), 0)
-            self.assertEqual(peak, 4)
-            self.assertEqual(len(set(seen)), 8)
+            self.assertEqual(peak, 6)
+            self.assertEqual(len(set(seen)), 12)
             records = read_lines(runner.batch / 'attempts.jsonl')
-            self.assertEqual(len(records), 8)
+            self.assertEqual(len(records), 12)
             self.assertNotIn('offline-secret', (runner.batch / 'attempts.jsonl').read_text())
-            self.assertEqual(json.loads((runner.batch / 'status.json').read_text())['completed_tasks'], 8)
+            self.assertEqual(json.loads((runner.batch / 'status.json').read_text())['completed_tasks'], 12)
             for record in records:
                 job = record['job_name']; log = Path(record['runner_records']) / 'harbor-console.log'
                 self.assertIn(job, log.read_text()); self.assertNotIn('offline-secret', log.read_text())
@@ -111,7 +111,7 @@ class BatchTest(unittest.TestCase):
             self.assertEqual([e['sequence'] for e in events], list(range(1, len(events)+1)))
             with patch.object(runner, 'execute', side_effect=AssertionError('must skip completed tasks')):
                 self.assertEqual(runner.run(), 0)
-            self.assertEqual(len(read_lines(runner.batch / 'attempts.jsonl')), 8)
+            self.assertEqual(len(read_lines(runner.batch / 'attempts.jsonl')), 12)
 
     def test_integration_failure_stops_dispatch_but_preserves_other_active_attempts(self):
         with TemporaryDirectory() as temp:
@@ -198,7 +198,7 @@ class BatchTest(unittest.TestCase):
     def test_invalid_concurrency_and_missing_package_are_rejected(self):
         with TemporaryDirectory() as temp:
             config = self.config(Path(temp))
-            for count in (0, 5):
+            for count in (0, 7):
                 with self.assertRaises(RunnerConfigError):self.batch(config, concurrency=count)
             (config.task_root/'owner__repo-0/instruction.md').unlink()
             with self.assertRaises(RunnerConfigError):self.batch(config)
