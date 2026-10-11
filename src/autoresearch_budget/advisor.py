@@ -11,7 +11,8 @@ from typing import Any
 from .models import Completion, CompletionBackend, FallbackClient, ModelError, OpenRouterClient
 
 
-POLICIES = {"actor_only", "fixed_interval", "advice_requested"}
+PHASE3_POLICIES = {"phase3_control", "plan_review", "recovery_review", "hybrid"}
+POLICIES = {"actor_only", "fixed_interval", "advice_requested"} | PHASE3_POLICIES
 SCHEDULED_QUESTION = ("Review the current approach, identify the most consequential gap, "
                       "and recommend a concrete next action with a way to validate it.")
 ADVISOR_SYSTEM = """You advise a small software engineering actor on a SWE-rebench task.
@@ -31,6 +32,9 @@ Answer its focused question using cited_evidence and the current context.
 If evidence is insufficient, identify what is missing and recommend a concrete
 check. Distinguish observations from assumptions.
 """
+CONTROLLER_ADVISOR_SYSTEM = REQUESTED_ADVISOR_SYSTEM.replace(
+    "This consultation was requested by the actor.",
+    "This focused consultation was initiated by the controller, possibly alongside an actor request.")
 
 
 class AdvisorUnavailable(ModelError):
@@ -61,6 +65,27 @@ class AdvicePolicy:
     max_calls: int = 100
     max_context_chars: int = 60_000
     max_output_tokens: int = 4096
+    stall_steps: int = 8
+    failure_threshold: int = 3
+    uncertainty_steps: int = 3
+    contradiction_steps: int = 2
+    min_actor_calls_remaining: int = 4
+
+    @property
+    def phase3(self) -> bool:
+        return self.policy in PHASE3_POLICIES
+
+    @property
+    def actor_requested(self) -> bool:
+        return self.policy == "advice_requested" or self.phase3
+
+    @property
+    def reviews_plans(self) -> bool:
+        return self.policy in {"plan_review", "hybrid"}
+
+    @property
+    def reviews_recovery(self) -> bool:
+        return self.policy in {"recovery_review", "hybrid"}
 
     @classmethod
     def load(cls, value: dict[str, Any]) -> "AdvicePolicy":
@@ -69,7 +94,9 @@ class AdvicePolicy:
             raise ValueError(f"policy must be one of {sorted(POLICIES)}")
         if config.policy != "fixed_interval" and "every_steps" in value:
             raise ValueError("every_steps applies only to fixed_interval")
-        for key in ("every_steps", "max_calls", "max_context_chars", "max_output_tokens"):
+        for key in ("every_steps", "max_calls", "max_context_chars", "max_output_tokens",
+                    "stall_steps", "failure_threshold", "uncertainty_steps", "contradiction_steps",
+                    "min_actor_calls_remaining"):
             number = getattr(config, key)
             minimum = 0 if key == "max_calls" else 1
             if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
@@ -242,7 +269,9 @@ class Advisor:
 
     def consult(self, packet: dict[str, Any], request_id: str) -> Completion:
         return asyncio.run(self.backend.complete(
-            [{"role": "system", "content": REQUESTED_ADVISOR_SYSTEM if packet.get("reason") == "advice_requested" else ADVISOR_SYSTEM},
+            [{"role": "system", "content": (REQUESTED_ADVISOR_SYSTEM if packet.get("reason") == "advice_requested"
+                                              else ADVISOR_SYSTEM if packet.get("reason", "fixed_interval") == "fixed_interval"
+                                              else CONTROLLER_ADVISOR_SYSTEM)},
              {"role": "user", "content": json.dumps(packet, ensure_ascii=False)}],
             request_id=request_id, max_tokens=self.max_tokens,
         ))

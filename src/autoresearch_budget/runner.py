@@ -394,6 +394,8 @@ class HarborTrialRunner:
     def _job_name(self, spec: TrialSpec) -> str:
         if self._scaffold() == self.ADVISORY_SCAFFOLD:
             policy = AdvicePolicy.load(self.config.consultation)
+            if policy.phase3:
+                return f"phase3-{policy.policy}-m{policy.max_calls}-{spec.profile}-{spec.task_id}-a{spec.attempt}"
             if policy.policy == "advice_requested":
                 return f"phase2-advice_requested-m{policy.max_calls}-{spec.profile}-{spec.task_id}-a{spec.attempt}"
             condition = f"{policy.policy}-k{policy.every_steps}" if policy.policy == "fixed_interval" else "actor_only"

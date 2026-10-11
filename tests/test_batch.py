@@ -203,6 +203,30 @@ class BatchTest(unittest.TestCase):
             (config.task_root/'owner__repo-0/instruction.md').unlink()
             with self.assertRaises(RunnerConfigError):self.batch(config)
 
+    def test_phase3_modes_have_distinct_jobs_frozen_configs_and_resume_guards(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp); config = self.config(root, count=1)
+            names = []
+            for mode in ('phase3_control', 'plan_review', 'recovery_review', 'hybrid'):
+                batch_dir = config.jobs_root/'_batch'/mode
+                argv = ['batch', 'run', '--config', str(config.path), '--batch-dir', str(batch_dir),
+                        '--advice-policy', mode, '--max-advice-calls', '7']
+                def execute(runner, claim, source):
+                    settings = json.loads(next(a[7:] for a in runner.runner.command(
+                        TrialSpec(claim['task_id'], 'small')) if a.startswith('config=')))
+                    self.assertEqual(settings['agent']['advice']['policy'], mode)
+                    names.append(claim['job_name'])
+                    return self.outcome(claim)
+                with patch('pathlib.Path.cwd', return_value=root), patch.object(BatchRunner, '_execute', execute):
+                    self.assertEqual(main(argv), 0)
+                    self.assertEqual(main(argv), 0)
+                    with patch('builtins.print'):
+                        self.assertEqual(main([*argv[:-1], '6']), 2)
+                frozen = ExperimentConfig.load(batch_dir/'config.json', project_root=root)
+                self.assertEqual(frozen.consultation['policy'], mode)
+            self.assertEqual(len(set(names)), 4)
+            self.assertTrue(all(name.startswith('phase3-') for name in names))
+
     def test_requested_policy_cli_overrides_freeze_and_resume_exact_settings(self):
         with TemporaryDirectory() as temp:
             root=Path(temp); config=self.config(root,count=1)

@@ -14,6 +14,8 @@ def summarize(summary, events):
     checkpoints = []
     decisions = []
     requests = []
+    interventions = []
+    recovery_checkpoints = []
     denials = Counter()
     latest = None
     contiguous = True
@@ -31,6 +33,10 @@ def summarize(summary, events):
         if event['kind'] == 'advice_requested':
             if payload.get('reason', 'fixed_interval') == 'fixed_interval':
                 checkpoints.append(payload.get('actor_call'))
+        if event['kind'] == 'intervention':
+            interventions.append(payload)
+        if event['kind'] == 'recovery_checkpoint':
+            recovery_checkpoints.append(payload)
         if event['kind'] == 'actor_advice_request':
             requests.append({k: payload.get(k) for k in ('actor_call', 'question', 'evidence_ids')})
         if event['kind'] == 'advice_denied':
@@ -49,6 +55,7 @@ def summarize(summary, events):
     used = counts['advice_requested']
     return {'summary': summary, 'latest_activity': latest, 'checkpoints': checkpoints,
             'advice_requests': requests, 'advice_dispatched': used,
+            'interventions': interventions, 'recovery_checkpoints': recovery_checkpoints,
             'advice_delivered': counts['advice_delivered'], 'advice_denials': dict(denials),
             'advice_calls_remaining': max(0, ceiling - used) if ceiling is not None else None,
             'decisions': decisions, 'event_sequence_contiguous': contiguous,

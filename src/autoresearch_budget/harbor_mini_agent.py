@@ -54,7 +54,7 @@ class AdvisoryMiniSweAgent(BudgetMiniSweAgent):
     """Install the small project extension alongside pinned mini-SWE."""
 
     SOURCE_DIR = "/opt/autoresearch-poc"
-    SOURCE_FILES = ("__init__.py", "models.py", "store.py", "contracts.py", "advisor.py", "actor_model.py", "poc_environment.py", "advisory_agent.py")
+    SOURCE_FILES = ("__init__.py", "models.py", "store.py", "contracts.py", "advisor.py", "actor_model.py", "poc_environment.py", "interventions.py", "advisory_agent.py")
 
     async def install(self, environment: BaseEnvironment) -> None:
         await super().install(environment)

@@ -20,7 +20,7 @@ class AdvisorContractsTest(unittest.TestCase):
         self.assertEqual(AdvicePolicy.load({'max_calls': 0}).max_calls, 0)
         self.assertFalse(AdvicePolicy.load({'policy': 'advice_requested'}).scheduled(10, 80, -1))
         for invalid in ({'every_steps': True}, {'max_calls': -1}, {'max_calls': True},
-                        {'policy':'actor_requested'}, {'policy':'hybrid'},
+                        {'policy':'actor_requested'}, {'policy':'not_a_policy'},
                         {'policy':'advice_requested','every_steps':10}):
             with self.assertRaises(ValueError):
                 AdvicePolicy.load(invalid)
