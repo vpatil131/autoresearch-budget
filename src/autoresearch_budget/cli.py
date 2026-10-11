@@ -12,12 +12,13 @@ from decimal import Decimal
 from pathlib import Path
 
 from .agent import AgentLimits, ExecResult, MinimalShellAgent
-from .budget import BudgetLedger
+from .budget import BudgetError, BudgetLedger
 from .models import ScriptedModel
 from .probe import run_probe
 from .runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, TrialSpec
 from .store import RunStore
 from .batch import BatchRunner
+from .trial_pool import MAX_WORKERS, TrialPool, select_tasks
 
 
 class _MockSandbox:
@@ -67,13 +68,17 @@ def _parser() -> argparse.ArgumentParser:
     mock = commands.add_parser("mock-run", help="zero-network scaffold smoke test")
     mock.add_argument("--output", type=Path)
 
-    trial = commands.add_parser("trial", help="plan or run one Harbor model trial")
+    trial = commands.add_parser("trial", help="plan or run Harbor trials with up to eight workers")
     trial_commands = trial.add_subparsers(dest="trial_command", required=True)
     for name in ("plan", "run"):
         command = trial_commands.add_parser(name)
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--profile", required=True)
-        command.add_argument("--task-id", required=True)
+        selection = command.add_mutually_exclusive_group(required=True)
+        selection.add_argument("--task-id", action="append", help="task ID; repeat to select multiple tasks")
+        selection.add_argument("--task-manifest", type=Path, help="JSON manifest containing tasks[].task_id")
+        command.add_argument("--workers", type=int, choices=range(1, MAX_WORKERS + 1), default=1)
+        command.add_argument("--env-file", default=".env")
         command.add_argument("--attempt", type=int, default=1)
 
     probe = commands.add_parser("probe", help="run one low-cost model probe")
@@ -136,12 +141,19 @@ def main(argv: list[str] | None = None) -> int:
         try:
             config = ExperimentConfig.load(args.config, project_root=Path.cwd())
             runner = HarborTrialRunner(config)
-            spec = TrialSpec(args.task_id, args.profile, args.attempt)
+            tasks = select_tasks(args.task_id, args.task_manifest)
+            specs = [TrialSpec(task, args.profile, args.attempt) for task in tasks]
+            pool = TrialPool(runner, specs, workers=args.workers, env_file=args.env_file)
             if args.trial_command == "plan":
-                print(shlex.join(runner.command(spec)))
+                if len(specs) == 1:
+                    print(shlex.join(pool.commands[0]))
+                else:
+                    print(json.dumps(pool.plan(), indent=2))
                 return 0
-            return runner.run(spec)
-        except RunnerConfigError as error:
+            if len(specs) == 1:
+                return runner.run(specs[0], env_file=args.env_file)
+            return pool.run(report=lambda result: print(json.dumps(result), flush=True))
+        except (RunnerConfigError, BudgetError, OSError, ValueError, KeyError, TypeError) as error:
             print(f"error: {error}")
             return 2
     if args.command == "probe":
