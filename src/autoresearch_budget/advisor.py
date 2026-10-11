@@ -24,7 +24,10 @@ Return only a JSON object with assessment, gap, next_action, validation, and
 assumptions (an array of strings). Identify a
 concrete uncertainty and a falsifiable next action; do not claim verified success.
 Review advice_followthrough when present: distinguish acknowledgment from actual
-execution and validation. Identify unfinished recommendations or unsupported
+execution and validation. related_advice_ids identifies earlier acknowledged
+guidance still open during a follow-up; new_observation_ids identifies cited
+checks run under that guidance. Clarify or revise it using the evidence without
+treating a follow-up as validation of earlier advice. Identify unfinished recommendations or unsupported
 claims using recorded commands and public observations. Recommend the next step.
 """
 REQUESTED_ADVISOR_SYSTEM = ADVISOR_SYSTEM + """This consultation was requested by the actor.
@@ -66,6 +69,7 @@ class AdvicePolicy:
     max_context_chars: int = 60_000
     max_output_tokens: int = 4096
     stall_steps: int = 8
+    inspection_steps: int = 8
     failure_threshold: int = 3
     uncertainty_steps: int = 3
     contradiction_steps: int = 2
@@ -95,7 +99,7 @@ class AdvicePolicy:
         if config.policy != "fixed_interval" and "every_steps" in value:
             raise ValueError("every_steps applies only to fixed_interval")
         for key in ("every_steps", "max_calls", "max_context_chars", "max_output_tokens",
-                    "stall_steps", "failure_threshold", "uncertainty_steps", "contradiction_steps",
+                    "stall_steps", "inspection_steps", "failure_threshold", "uncertainty_steps", "contradiction_steps",
                     "min_actor_calls_remaining"):
             number = getattr(config, key)
             minimum = 0 if key == "max_calls" else 1
@@ -155,6 +159,8 @@ def advice_packet(
     followthrough: list[dict] | None = None,
     reason: str = "fixed_interval", cited_evidence: dict[str, str] | None = None,
     advice_calls_remaining: int | None = None,
+    related_advice_ids: list[str] | tuple[str, ...] = (),
+    new_observation_ids: list[str] | tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Bound model-visible public evidence, retaining excerpts of large observations."""
     if max_chars < 1000:
@@ -182,6 +188,9 @@ def advice_packet(
         "current_patch": {"patch_id": patch_id, "diff": clip(diff, max_chars // 4)},
         "recent_transcript": [], "context_truncated": False,
     }
+    if related_advice_ids:
+        packet["related_advice_ids"] = list(related_advice_ids)
+        packet["new_observation_ids"] = list(new_observation_ids)
     if followthrough:
         # Reserve bounded space for advice history instead of silently letting
         # growing command records displace the entire packet.

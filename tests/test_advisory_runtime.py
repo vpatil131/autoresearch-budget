@@ -112,6 +112,7 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         return response(index, name="propose_plan", args={
             "hypothesis": hypothesis, "approach": "Invalidate the consumer cache",
             "falsifying_check": "Disable cache and reproduce", "validation_plan": "Test both entry points",
+            "previous_plan_id": "", "change_reason": "The observed consumer behavior supports this initial plan",
             "evidence_ids": ["observation-1"], "state": STATE, **extra})
 
     def checkpoint(self, index, *, question="Why does the same check still fail?", **extra):
@@ -138,7 +139,110 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertIn("Invalidate the consumer cache", packet["question"])
         self.assertEqual(set(packet["cited_evidence"]), {"observation-1"})
         self.assertEqual(agent.state["hypothesis"], "A consumer retains stale state")
-        self.assertEqual(json.loads((agent.advice_store.run_dir/"metadata.json").read_text())["contract_version"], "phase3-v1")
+        self.assertEqual(json.loads((agent.advice_store.run_dir/"metadata.json").read_text())["contract_version"], "phase3-v3")
+
+    def test_phase3_followup_keeps_prior_advice_open_and_requires_all_resolutions(self):
+        agent = self.agent([response(1), self.plan(2),
+            response(3, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
+            self.request(4, ids=["observation-3"], advice_progress=[progress("advice-1", "", status="in_progress")]),
+            response(5, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-2"),
+                              "advice_progress": [progress("advice-1", "", status="in_progress")]}),
+            self.finish(6, advice_progress=[progress("advice-2", "observation-5")]),
+            self.finish(7, advice_progress=[progress("advice-1", "", status="in_progress"), progress("advice-2", "observation-5")]),
+            self.finish(8, advice_progress=[progress("advice-1", "observation-5"), progress("advice-2", "observation-5")])],
+            policy="plan_review", max_calls=7)
+        self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
+        self.assertEqual(agent.advisor_calls, 2)
+        packet = [e["payload"]["packet"] for e in self.events(agent) if e["kind"] == "advice_requested"][1]
+        self.assertEqual(packet["related_advice_ids"], ["advice-1"])
+        self.assertEqual(packet["new_observation_ids"], ["observation-3"])
+        history = json.loads(packet["advice_followthrough"])
+        self.assertEqual(history[0]["status"], "in_progress")
+        self.assertEqual(history[0]["guidance"], GUIDANCE)
+        self.assertEqual(agent.advice_records["advice-2"]["related_advice_ids"], ["advice-1"])
+        self.assertTrue(all(r["status"] == "validated" for r in agent.advice_records.values()))
+        errors = [e["payload"]["error"] for e in self.events(agent) if e["kind"] == "actor_schema_error"]
+        self.assertTrue(any("exactly the open advice" in error for error in errors))
+        self.assertTrue(any("before submission" in error for error in errors))
+
+    def test_phase3_plan_revision_can_review_while_prior_advice_is_in_progress(self):
+        agent = self.agent([response(1), self.plan(2),
+            response(3, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
+            self.plan(4, hypothesis="The producer fails to update", previous_plan_id="plan-1",
+                      change_reason="The fresh check shifts the causal explanation", evidence_ids=["observation-3"],
+                      advice_progress=[progress("advice-1", "", status="in_progress")]),
+            response(5, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-2"),
+                              "advice_progress": [progress("advice-1", "", status="in_progress")]}),
+            self.finish(6, advice_progress=[progress("advice-1", "observation-5"), progress("advice-2", "observation-5")])],
+            policy="plan_review", max_calls=7)
+        self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
+        self.assertEqual(agent.advisor_calls, 2)
+        self.assertEqual(agent.interventions.plan_number, 2)
+        packet = [e["payload"]["packet"] for e in self.events(agent) if e["kind"] == "advice_requested"][1]
+        self.assertEqual(packet["related_advice_ids"], ["advice-1"])
+        self.assertEqual(json.loads(packet["advice_followthrough"])[0]["status"], "in_progress")
+
+    def test_phase3_pending_guidance_still_blocks_followup_and_automatic_dispatch(self):
+        agent = self.agent([response(1), self.plan(2), self.request(3), self.plan(4),
+            response(5, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
+            self.finish(6, advice_progress=[progress("advice-1", "observation-5")])], policy="plan_review")
+        self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
+        self.assertEqual(agent.advisor_calls, 1)
+        errors = [e["payload"]["error"] for e in self.events(agent) if e["kind"] == "actor_schema_error"]
+        self.assertEqual(sum("pending guidance" in e for e in errors), 2)
+        agent.pending_advice = "advice-1"
+        self.assertIn("pending_advice", agent._phase3_consult("Clarify", ["plan_review"], ["observation-1"]))
+        self.assertEqual(agent.advisor_calls, 1)
+        self.assertEqual(agent.pending_advice, "advice-1")
+
+    def test_phase3_followup_limit_does_not_close_prior_advice(self):
+        agent = self.agent([response(1), self.plan(2),
+            response(3, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
+            self.request(4, advice_progress=[progress("advice-1", "", status="in_progress")]),
+            self.finish(5, advice_progress=[progress("advice-1", "observation-3")])],
+            policy="plan_review", max_calls=1)
+        self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
+        self.assertEqual(agent.advisor_calls, 1)
+        self.assertEqual(agent.advice_denials, {"call_limit": 1})
+        result = [e["payload"] for e in self.events(agent) if e["kind"] == "intervention_result"][-1]
+        self.assertFalse(result["delivered"])
+        packet_history = [e["payload"] for e in self.events(agent) if e["kind"] == "advice_status"]
+        self.assertTrue(any(e.get("status") == "in_progress" for e in packet_history))
+
+    def test_phase3_failed_followup_preserves_earlier_open_status(self):
+        advisor = Mock()
+        advisor.consult.side_effect = [Completion(content=json.dumps(GUIDANCE), response_id="offline", requested_model="mock/advisor", served_model="mock/advisor", cost_usd=Decimal("0.02")),
+                                      ModelError("Follow-up unavailable")]
+        agent = self.agent([response(1), self.plan(2),
+            response(3, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
+            self.request(4, advice_progress=[progress("advice-1", "", status="in_progress")]),
+            self.finish(5, advice_progress=[progress("advice-1", "observation-3")])],
+            policy="plan_review", advisor=advisor, max_calls=7)
+        self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
+        self.assertEqual(agent.advisor_calls, 2)
+        self.assertEqual(agent.advisor_failures, 1)
+        self.assertEqual(set(agent.advice_records), {"advice-1"})
+        self.assertIsNone(agent.pending_advice)
+        packet = advisor.consult.call_args_list[1].args[0]
+        self.assertEqual(json.loads(packet["advice_followthrough"])[0]["status"], "in_progress")
+        statuses = [e["payload"]["status"] for e in self.events(agent) if e["kind"] == "advice_status"]
+        self.assertEqual(statuses[-2:], ["in_progress", "validated"])
+
+    def test_phase3_hybrid_recovery_can_review_while_plan_advice_is_open(self):
+        ongoing = {"advice_progress": [progress("advice-1", "", status="in_progress")]}
+        agent = self.agent([response(1), self.plan(2),
+            self.failed_check(3, advice_decision=adopt("advice-1")),
+            self.failed_check(4, **ongoing), self.failed_check(5, **ongoing),
+            self.checkpoint(6, evidence_ids=["observation-5"], **ongoing),
+            response(7, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-2"), **ongoing}),
+            self.finish(8, advice_progress=[progress("advice-1", "observation-7"), progress("advice-2", "observation-7")])],
+            policy="hybrid", max_calls=7)
+        self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
+        requests = [e["payload"] for e in self.events(agent) if e["kind"] == "advice_requested"]
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[1]["reason"], "repeated_failure")
+        self.assertEqual(requests[1]["related_advice_ids"], ["advice-1"])
+        self.assertEqual(requests[1]["packet"]["new_observation_ids"], ["observation-5"])
 
     def test_phase3_control_has_common_tools_without_automatic_reviews(self):
         agent = self.agent([response(1), self.plan(2), self.finish(3)], policy="phase3_control", max_calls=7)
@@ -153,18 +257,88 @@ class AdvisoryRuntimeTest(unittest.TestCase):
                              "evidence_refs": ["observation-1"]}
         agent = self.agent([response(1), self.plan(2),
             response(3, args={"command": "true", "state": STATE, "advice_decision": reject("advice-1")}),
-            self.plan(4), self.plan(5, hypothesis="The producer fails to update"),
+            self.plan(4), self.plan(5, hypothesis="The producer fails to update", previous_plan_id="plan-1",
+                                    change_reason="The fresh observation contradicts the consumer explanation"),
             response(6, args={"command": "true", "state": STATE, "advice_decision": reject("advice-2")}),
             self.finish(7)], policy="plan_review", max_calls=7)
         self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
         self.assertEqual(agent.advisor_calls, 2)
         self.assertEqual(agent.interventions.plan_number, 2)
+        packet = [e["payload"]["packet"] for e in self.events(agent) if e["kind"] == "advice_requested"][1]
+        self.assertIn('"previous_plan": {"plan_id": "plan-1"', packet['question'])
+        self.assertIn('contradicts the consumer explanation', packet['question'])
+        self.assertIn('advice_followthrough', packet)
+
+    def test_phase3_inspection_accepts_insufficient_evidence_and_preserves_isolation(self):
+        inspection = {"explanation": "Insufficient evidence to distinguish producer and consumer",
+                      "approach": "Inspect the cache boundary", "alternatives": "Producer or consumer",
+                      "missing_evidence": "A cache bypass result"}
+        test_root = self.root
+        for mode in ("plan_review", "hybrid", "recovery_review", "phase3_control"):
+            with self.subTest(mode=mode):
+                self.root = test_root/mode
+                actions = [response(1), response(2), self.checkpoint(3, inspection=inspection)]
+                if mode in {"plan_review", "hybrid"}:
+                    actions += [response(4, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
+                                self.finish(5, advice_progress=[progress("advice-1", "observation-4")])]
+                else:
+                    actions += [self.finish(4)]
+                agent = self.agent(actions, policy=mode, inspection_steps=2, max_calls=7)
+                self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
+                self.assertEqual(agent.advisor_calls, int(mode in {"plan_review", "hybrid"}))
+                events = self.events(agent)
+                self.assertEqual(next(e['payload']['actor_call'] for e in events if e['kind'] == 'inspection_checkpoint'), 2)
+                self.assertEqual(agent.interventions.inspection_responses[0]['inspection'], inspection)
+                self.assertIsNone(agent.interventions.plan)
+                if agent.advisor_calls:
+                    packet = next(e['payload']['packet'] for e in events if e['kind'] == 'advice_requested')
+                    self.assertEqual(packet['reason'], 'inspection_checkpoint')
+                    self.assertIn('Insufficient evidence', packet['question'])
+
+    def test_phase3_inspection_cannot_be_skipped_or_answered_without_reasoning(self):
+        inspection = {key: 'Unknown; inspect boundary next' for key in ('explanation', 'approach', 'alternatives', 'missing_evidence')}
+        agent = self.agent([response(1), response(2),
+            response(3, args={'command': 'touch checkpoint-bypassed', 'state': STATE}),
+            self.finish(4), self.checkpoint(5, inspection=inspection), self.finish(6)],
+            policy='phase3_control', inspection_steps=2)
+        self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        self.assertFalse((self.repo/'checkpoint-bypassed').exists())
+        self.assertEqual(len([e for e in self.events(agent) if e['kind'] == 'actor_schema_error']), 2)
+
+    def test_phase3_inspection_requires_reasoning_fields(self):
+        inspection = {key: 'Unknown; inspect boundary next' for key in ('explanation', 'approach', 'alternatives', 'missing_evidence')}
+        agent = self.agent([response(1), response(2), self.checkpoint(3),
+                            self.checkpoint(4, inspection=inspection), self.finish(5)],
+                           policy='phase3_control', inspection_steps=2)
+        self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        self.assertEqual(len([e for e in self.events(agent) if e['kind'] == 'actor_schema_error']), 1)
+
+    def test_phase3_plan_satisfies_inspection_with_one_combined_consultation(self):
+        agent = self.agent([response(1), response(2), self.plan(3),
+            response(4, args={'command': 'true', 'state': STATE, 'advice_decision': adopt('advice-1')}),
+            self.finish(5, advice_progress=[progress('advice-1', 'observation-4')])],
+            policy='plan_review', inspection_steps=2)
+        self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        self.assertEqual(agent.advisor_calls, 1)
+        reasons = next(e['payload']['reasons'] for e in self.events(agent) if e['kind'] == 'intervention')
+        self.assertEqual(reasons, ['plan_review', 'inspection_checkpoint'])
+        self.assertIsNone(agent.interventions.inspection_checkpoint)
+
+    def test_phase3_revision_rejects_stale_predecessor_before_review(self):
+        agent = self.agent([response(1), self.plan(2),
+            self.plan(3, hypothesis='Producer is responsible', previous_plan_id='plan-0'),
+            self.plan(4, hypothesis='Producer is responsible', previous_plan_id='plan-1'), self.finish(5)],
+            policy='phase3_control')
+        self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        self.assertEqual(agent.interventions.plan_number, 2)
+        self.assertEqual(agent.interventions.plans[1]['previous_plan_id'], 'plan-1')
+        self.assertEqual(len([e for e in self.events(agent) if e['kind'] == 'actor_schema_error']), 1)
 
     def test_phase3_repeated_failure_review_and_isolation(self):
         agent = self.agent([self.failed_check(1), self.failed_check(2), self.failed_check(3), self.checkpoint(4),
             response(5, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
             self.finish(6, advice_progress=[progress("advice-1", "observation-5")])],
-            policy="recovery_review", max_calls=7)
+            policy="recovery_review", max_calls=7, inspection_steps=100)
         self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
         self.assertEqual(agent.advisor_calls, 1)
         events = self.events(agent)
@@ -212,7 +386,7 @@ class AdvisoryRuntimeTest(unittest.TestCase):
             self.checkpoint(10, question=""), response(11, args={"command": "true", "state": diagnose}),
             response(12, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
             self.finish(13, advice_progress=[progress("advice-1", "observation-12")])],
-            policy="recovery_review", max_calls=7)
+            policy="recovery_review", max_calls=7, inspection_steps=100)
         self.assertEqual(agent.run("Issue")["exit_status"], "Submitted")
         events = self.events(agent)
         self.assertEqual(next(e["payload"]["actor_call"] for e in events if e["kind"] == "recovery_checkpoint"), 9)

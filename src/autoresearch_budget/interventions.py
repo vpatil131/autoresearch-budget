@@ -30,6 +30,10 @@ class InterventionCollector:
         self.fallback_ready = False
         self.fallback_after = None
         self.last_observation = None
+        self.inspection_checkpoint = None
+        self.last_inspection_response = 0
+        self.inspection_responses = []
+        self.plans = []
 
     def action(self, action, call):
         state = action["state"]
@@ -64,14 +68,44 @@ class InterventionCollector:
         self.fallback_ready = False
         self.fallback_after = None
 
-    def publish_plan(self, action):
+    def plan_key(self, action):
         fields = ("hypothesis", "approach", "falsifying_check", "validation_plan")
-        key = fingerprint([" ".join(action[field].split()) for field in fields])
+        return fingerprint([" ".join(action[field].split()) for field in fields])
+
+    def validate_plan(self, action):
+        previous = action["previous_plan_id"]
+        if self.plan is None:
+            if previous:
+                raise ValueError("Initial plan requires previous_plan_id='' (no prior plan)")
+        elif self.plan_key(action) != self.plan["key"]:
+            if previous != self.plan["plan_id"]:
+                raise ValueError(f"Revision must reference current plan {self.plan['plan_id']} in previous_plan_id")
+        elif previous not in {self.plan["plan_id"], self.plan["previous_plan_id"]}:
+            raise ValueError("Duplicate plan must reference its recorded predecessor or current plan ID")
+
+    def publish_plan(self, action):
+        self.validate_plan(action)
+        fields = ("hypothesis", "approach", "falsifying_check", "validation_plan")
+        key = self.plan_key(action)
         if self.plan is None or self.plan["key"] != key:
             self.plan_number += 1
-        self.plan = {"plan_id": f"plan-{self.plan_number}", "key": key,
-                     **{field: action[field] for field in fields}, "evidence_ids": action["evidence_ids"]}
+            self.plan = {"plan_id": f"plan-{self.plan_number}", "key": key,
+                         **{field: action[field] for field in fields}, "evidence_ids": action["evidence_ids"],
+                         "previous_plan_id": action["previous_plan_id"], "change_reason": action["change_reason"]}
+            self.plans.append(self.plan)
+        self.inspection_checkpoint = None
         return self.plan
+
+    def inspection_due(self, call):
+        return (self.plan is None and self.last_observation is not None
+                and call - self.last_inspection_response >= self.policy.inspection_steps)
+
+    def record_inspection(self, action, call):
+        self.inspection_responses.append({"actor_call": call, "inspection": action["inspection"],
+                                          "question": action["question"], "next_check": action["next_check"],
+                                          "evidence_ids": action["evidence_ids"]})
+        self.last_inspection_response = call
+        self.inspection_checkpoint = None
 
     def observation(self, action, result, call, observation_id, source_hash, visible_text):
         self.last_observation = observation_id
@@ -125,7 +159,8 @@ class InterventionCollector:
                             source_hash, self.evidence_facts.get(self.last_observation)])
 
     def summary(self):
-        return {"plan": self.plan, "plan_versions": self.plan_number,
+        return {"plan": self.plan, "plan_versions": self.plan_number, "plans": self.plans,
+                "inspection_checkpoint": self.inspection_checkpoint, "inspection_responses": self.inspection_responses,
                 "last_progress_call": self.last_progress_call, "failure_streak": self.failure_count,
                 "checks": self.checks, "checkpoint": self.checkpoint,
                 "reviewed_plans": len(self.reviewed_plans), "handled_recovery": len(self.handled_recovery)}

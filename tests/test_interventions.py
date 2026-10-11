@@ -60,6 +60,37 @@ class InterventionsTest(unittest.TestCase):
         self.assertEqual(collector.reasons(20, STATE), [])
         self.assertEqual(collector.reasons(20, {**STATE, 'blocker': 'environment'}), [])
 
+    def test_inspection_checkpoint_repeats_until_plan_and_progress_cannot_postpone_it(self):
+        collector = self.collector()
+        self.assertFalse(collector.inspection_due(8))  # No visible evidence yet.
+        collector.last_observation = 'observation-1'
+        collector.advance(8)
+        self.assertTrue(collector.inspection_due(8))
+        action = {'inspection': {key: 'Insufficient evidence' for key in ('explanation', 'approach', 'alternatives', 'missing_evidence')},
+                  'question': '', 'next_check': 'Inspect boundary', 'evidence_ids': ['observation-1']}
+        collector.record_inspection(action, 9)
+        self.assertFalse(collector.inspection_due(16))
+        self.assertTrue(collector.inspection_due(17))
+        plan = {'hypothesis': 'Tentative cause', 'approach': 'Check the boundary', 'falsifying_check': 'Bypass cache',
+                'validation_plan': 'Run regression', 'evidence_ids': ['observation-1'],
+                'previous_plan_id': '', 'change_reason': 'Initial evidence'}
+        collector.publish_plan(plan)
+        self.assertFalse(collector.inspection_due(100))
+
+    def test_revision_chain_duplicate_suppression_and_stale_reference(self):
+        collector = self.collector()
+        plan = {'hypothesis': 'Cause A', 'approach': 'Approach A', 'falsifying_check': 'Check A',
+                'validation_plan': 'Regression', 'evidence_ids': ['observation-1'],
+                'previous_plan_id': '', 'change_reason': 'Initial evidence'}
+        first = collector.publish_plan(plan)
+        self.assertIs(collector.publish_plan({**plan, 'hypothesis': '  Cause   A '}), first)
+        with self.assertRaises(ValueError): collector.publish_plan({**plan, 'hypothesis': 'Cause B'})
+        second = collector.publish_plan({**plan, 'hypothesis': 'Cause B', 'previous_plan_id': 'plan-1',
+                                         'change_reason': 'Observation 2 rules out A'})
+        self.assertEqual(second['plan_id'], 'plan-2')
+        self.assertEqual(second['previous_plan_id'], 'plan-1')
+        self.assertEqual(len(collector.plans), 2)
+
     def test_unsupported_uncertainty_does_not_trigger(self):
         collector = self.collector()
         for call in range(1, 5):
@@ -98,7 +129,7 @@ class InterventionsTest(unittest.TestCase):
             self.assertEqual(policy.reviews_plans, mode in {'plan_review', 'hybrid'})
             self.assertEqual(policy.reviews_recovery, mode in {'recovery_review', 'hybrid'})
             self.assertFalse(policy.scheduled(10, 80, -1))
-        for field in ('stall_steps', 'failure_threshold', 'uncertainty_steps', 'contradiction_steps', 'min_actor_calls_remaining'):
+        for field in ('stall_steps', 'inspection_steps', 'failure_threshold', 'uncertainty_steps', 'contradiction_steps', 'min_actor_calls_remaining'):
             for value in (True, 0, '8'):
                 with self.assertRaises(ValueError): AdvicePolicy.load({'policy': 'hybrid', field: value})
 

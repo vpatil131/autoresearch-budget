@@ -130,7 +130,9 @@ class AdvisoryAgent(DefaultAgent):
             self.add_messages(self.model.format_message(role="user", content=guidance,
                               extra={"advice_id": self.pending_advice} if self.pending_advice else {}))
         if self.policy.phase3 and capacity and time_remaining:
-            self._recovery_checkpoint()
+            self._inspection_checkpoint()
+            if not self.interventions.inspection_checkpoint:
+                self._recovery_checkpoint()
         # DefaultAgent owns call counting and billing, including format-error calls.
         self.model.actor_call = self.n_calls + 1
         self.model.pending_advice = self.pending_advice
@@ -164,6 +166,14 @@ class AdvisoryAgent(DefaultAgent):
             decision = action.get("advice_decision")
             validate_advice_context(action, pending_advice=self.pending_advice,
                                    records=self.advice_records, observation_ids=self.observation_ids, patch_ids=self.visible_patch_ids)
+            if self.interventions:
+                if self.interventions.inspection_checkpoint:
+                    if action["name"] not in {"propose_plan", "report_checkpoint"}:
+                        raise ValueError("Respond to the inspection checkpoint with propose_plan or report_checkpoint before continuing")
+                    if action["name"] == "report_checkpoint" and "inspection" not in action:
+                        raise ValueError("Inspection checkpoint requires inspection explanation, approach, alternatives, and missing_evidence")
+                if action["name"] == "propose_plan":
+                    self.interventions.validate_plan(action)
         except (ValueError, KeyError, TypeError) as error:
             self.advice_store.append_event("actor_schema_error", {"actor_call": self.n_calls, "error": str(error)})
             # A parsed assistant tool call is already in the transcript; close it
@@ -266,16 +276,20 @@ class AdvisoryAgent(DefaultAgent):
             "observation_id": observation_id, "patch_id": self.patch_id, "messages": observations})
         return self.add_messages(*observations)
 
-    def _phase3_busy(self):
-        return bool(self.pending_advice or any(record["status"] in OPEN_ADVICE_STATUSES
-                                              for record in self.advice_records.values()))
+    def _phase3_awaiting_decision(self):
+        return self.pending_advice is not None
 
     def _phase3_consult(self, question, reasons, evidence_ids, *, automatic=True):
         reasons = list(dict.fromkeys(reasons))
         refs = list(dict.fromkeys(evidence_ids))[:8]
+        related = [key for key, record in self.advice_records.items()
+                   if record["status"] in OPEN_ADVICE_STATUSES]
+        observed = {entry["observation_id"] for key in related
+                    for entry in self.advice_records[key]["actions"]}
+        new_refs = [ref for ref in refs if ref in observed]
         denied = None
-        if self._phase3_busy():
-            denied = "open_advice"
+        if self._phase3_awaiting_decision():
+            denied = "pending_advice"
         elif self.config.step_limit and self.config.step_limit - self.n_calls < self.policy.min_actor_calls_remaining:
             denied = "no_actor_capacity"
         elif self._command_time_remaining() is not None and self._command_time_remaining() <= 0:
@@ -283,12 +297,14 @@ class AdvisoryAgent(DefaultAgent):
         self.advice_store.append_event("intervention", {"actor_call": self.n_calls,
             "reasons": reasons, "question": question, "evidence_ids": refs,
             "automatic": automatic, "plan_id": self.interventions.plan and self.interventions.plan["plan_id"],
-            "patch_id": self.patch_id, "denied": denied})
+            "patch_id": self.patch_id, "denied": denied,
+            "related_advice_ids": related, "new_observation_ids": new_refs})
         if denied:
             return self._deny_advice(denied)
         before = self.advisor_calls
         try:
-            guidance = self._consult(question=question, reason="+".join(reasons), evidence_ids=refs)
+            guidance = self._consult(question=question, reason="+".join(reasons), evidence_ids=refs,
+                                     related_advice_ids=related, new_observation_ids=new_refs)
         except AdvisorUnavailable:
             # Phase 3 advice is optional. Retain failed usage and allow independent
             # continuation; Phase 1/2 preserve their original failure behavior.
@@ -297,7 +313,8 @@ class AdvisoryAgent(DefaultAgent):
             guidance = "Advisor unavailable; the failed consultation was recorded. Continue independently."
         self.advice_store.append_event("intervention_result", {"actor_call": self.n_calls,
             "reasons": reasons, "advice_id": f"advice-{self.advisor_calls}" if self.advisor_calls > before else None,
-            "delivered": self.pending_advice is not None, "guidance": guidance})
+            "delivered": self.pending_advice is not None, "guidance": guidance,
+            "related_advice_ids": related})
         return guidance
 
     def _finish_checkpoint(self):
@@ -316,14 +333,18 @@ class AdvisoryAgent(DefaultAgent):
         collector = self.interventions
         reasons = []
         if action["name"] == "propose_plan":
+            previous = collector.plan
+            inspection_pending = collector.inspection_checkpoint is not None
             plan = collector.publish_plan(action)
             self.state["hypothesis"] = plan["hypothesis"]
             self.advice_store.append_event("plan_proposed", {"actor_call": self.n_calls, **plan})
             question = ("Is this causal hypothesis reasonable given the evidence? Critique the proposed approach, "
                         "identify assumptions and missing behavior, and recommend a falsifying check.\n"
-                        + json.dumps({key: plan[key] for key in ("hypothesis", "approach", "falsifying_check", "validation_plan")}))
+                        + json.dumps({"current_plan": plan, "previous_plan": previous}))
             if self.policy.reviews_plans and plan["key"] not in collector.reviewed_plans:
                 reasons.append("plan_review")
+                if inspection_pending:
+                    reasons.append("inspection_checkpoint")
             if collector.checkpoint and self.policy.reviews_recovery:
                 reasons += collector.checkpoint["reasons"]
             if reasons:
@@ -333,6 +354,18 @@ class AdvisoryAgent(DefaultAgent):
                 self._finish_checkpoint()
             else:
                 guidance = f"Recorded {plan['plan_id']}; automatic review disabled or this plan already reviewed. Continue with your next check."
+            guidance = f"Current plan: {plan['plan_id']}. Reference this ID in previous_plan_id when revising.\n" + guidance
+        elif collector.inspection_checkpoint:
+            collector.record_inspection(action, self.n_calls)
+            self.advice_store.append_event("inspection_response", collector.inspection_responses[-1])
+            if self.policy.reviews_plans:
+                question = ("Review this tentative investigation direction. Insufficient evidence is valid; "
+                            "assess competing explanations and recommend the most useful discriminating next check.\n"
+                            + json.dumps({key: action[key] for key in ("inspection", "question", "next_check")}))
+                guidance = self._phase3_consult(question, ["inspection_checkpoint"], action["evidence_ids"])
+            else:
+                guidance = "Inspection reasoning recorded locally; automatic plan review is disabled. Execute the proposed next check."
+            self._finish_checkpoint()
         else:
             self.advice_store.append_event("checkpoint_response", {"actor_call": self.n_calls, "action": action})
             if not collector.checkpoint:
@@ -346,14 +379,29 @@ class AdvisoryAgent(DefaultAgent):
                 collector.fallback_after = self.n_calls
                 guidance = "Execute the proposed next check. The controller will assess new evidence before another review."
                 if not self.policy.reviews_recovery:
+                    guidance = ("No advisor consultation occurred: automatic recovery review is disabled. "
+                                "Execute the proposed next check, or use request_advice for an unresolved question.")
                     self._finish_checkpoint()
         observations = self.model.format_observation_messages(message,
             [{"output": guidance, "returncode": 0, "exception_info": ""}], self.get_template_vars())
         return self.add_messages(*observations)
 
+    def _inspection_checkpoint(self):
+        collector = self.interventions
+        if self._phase3_awaiting_decision() or collector.inspection_checkpoint or not collector.inspection_due(self.n_calls):
+            return
+        collector.inspection_checkpoint = {"actor_call": self.n_calls, "reason": "inspection_checkpoint"}
+        self.advice_store.append_event("inspection_checkpoint", collector.inspection_checkpoint)
+        self.add_messages(self.model.format_message(role="user", content=(
+            "Inspection checkpoint: publish your tentative hypothesis and approach now using propose_plan if actionable, "
+            "or respond with report_checkpoint including inspection.explanation, inspection.approach, "
+            "inspection.alternatives, inspection.missing_evidence, question, next_check, and evidence_ids. "
+            "Insufficient evidence is valid. Identify supporting/contradicting observations and the next discriminating check. "
+            "Respond before further execution or submission; certainty is not required.")))
+
     def _recovery_checkpoint(self):
         collector = self.interventions
-        if self._phase3_busy():
+        if self._phase3_awaiting_decision():
             return
         if collector.fallback_ready and collector.checkpoint:
             refs = list(dict.fromkeys([*collector.checkpoint.get("evidence_ids", []), collector.last_observation]))
@@ -433,7 +481,8 @@ class AdvisoryAgent(DefaultAgent):
             self.advisor_prompt_tokens += int(usage.get("prompt_tokens") or 0)
             self.advisor_completion_tokens += int(usage.get("completion_tokens") or 0)
 
-    def _consult(self, *, question=SCHEDULED_QUESTION, reason="fixed_interval", evidence_ids=()):
+    def _consult(self, *, question=SCHEDULED_QUESTION, reason="fixed_interval", evidence_ids=(),
+                 related_advice_ids=(), new_observation_ids=()):
         if self.advisor_calls >= self.policy.max_calls:
             return self._deny_advice("call_limit")
         cited = {ref: self.visible_evidence[ref] if ref in self.visible_evidence else self.patch_evidence[ref]
@@ -444,7 +493,8 @@ class AdvisoryAgent(DefaultAgent):
                 actor_limit=self.config.step_limit, max_chars=self.policy.max_context_chars,
                 state=self.state, patch_id=self.patch_id, reason=reason, cited_evidence=cited,
                 advice_calls_remaining=self.policy.max_calls - self.advisor_calls - 1,
-                followthrough=list(self.advice_records.values()))
+                followthrough=list(self.advice_records.values()),
+                related_advice_ids=related_advice_ids, new_observation_ids=new_observation_ids)
         except ValueError:
             return self._deny_advice("context_limit")
         packet = self.advice_store.redact(packet)
@@ -453,7 +503,8 @@ class AdvisoryAgent(DefaultAgent):
         request_id = f"{self.advice_store.run_id}:{advice_id}"
         self.advice_store.append_event("advice_requested", {"actor_call": self.n_calls,
             "advice_id": advice_id, "request_id": request_id, "reason": reason,
-            "evidence_ids": list(evidence_ids), "packet": packet})
+            "evidence_ids": list(evidence_ids), "packet": packet,
+            "related_advice_ids": list(related_advice_ids)})
         started = time.monotonic()
         try:
             if self.advisor is None:
@@ -485,9 +536,9 @@ class AdvisoryAgent(DefaultAgent):
             raise AdvisorUnavailable(f"Advisor consultation {advice_id} returned invalid guidance: {error}") from error
         self.pending_advice = advice_id
         self.advice_records[advice_id] = {"advice_id": advice_id, "guidance": guidance,
-            "status": "delivered", "actions": []}
+            "status": "delivered", "actions": [], "related_advice_ids": list(related_advice_ids)}
         self.advice_store.append_event("advice_delivered", {"actor_call": self.n_calls,
-            "advice_id": advice_id, "guidance": guidance})
+            "advice_id": advice_id, "guidance": guidance, "related_advice_ids": list(related_advice_ids)})
         return f"Advisor guidance ({advice_id}):\n{json.dumps(guidance)}\nInclude advice_decision for {advice_id} in your next action."
 
     def serialize(self, *extra_dicts):

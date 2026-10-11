@@ -7,7 +7,7 @@ from typing import Any
 
 CONTRACT_VERSION = "phase1-v2"
 PHASE2_CONTRACT_VERSION = "phase2-v1"
-PHASE3_CONTRACT_VERSION = "phase3-v1"
+PHASE3_CONTRACT_VERSION = "phase3-v3"
 ACTOR_SYSTEM = """You solve software engineering issues using the repository and visible checks.
 Own the diagnosis, edits, validation, and submission. Every response must call
 exactly one native tool: execute or submit. Use execute for shell commands;
@@ -77,9 +77,20 @@ pending guidance before requesting more advice.""")
         system += """
 Phase 3: Before implementing your first actionable diagnosis, use propose_plan
 with hypothesis, approach, evidence_ids, falsifying_check, and validation_plan.
+Every plan includes previous_plan_id (empty for the initial plan, current plan ID
+for a revision) and change_reason explaining the initial choice or what changed
+and why the cited evidence changes your solution. Routine environment or test
+fixture fixes are progress, not new solution hypotheses.
 Publish materially revised causal explanations or approaches with propose_plan;
 retain the same wording for an unchanged plan. Do not count rewording as progress.
 The controller records every plan and may return advice before implementation.
+Do not wait for certainty to expose an actionable tentative approach. When the
+controller sends an inspection checkpoint, respond with propose_plan if ready,
+or report_checkpoint with inspection.explanation, inspection.approach,
+inspection.alternatives, inspection.missing_evidence, question, next_check, and
+evidence_ids. Insufficient evidence is a valid explanation: state the competing
+possibilities and discriminating next check. You must respond before further
+execution or submission. This is a reasoning checkpoint, not a diagnosis deadline.
 On a local recovery checkpoint, use report_checkpoint with a focused unresolved
 question (empty only if one next experiment can resolve it), next_check, and
 observed evidence_ids. The controller may consult, or allow that experiment.
@@ -92,8 +103,13 @@ state.evidence_refs. Optionally report progress with kind, summary, and evidence
 from completed observations or visible patches. Kinds: localization,
 discriminating_check, candidate, validation, environment_recovery. New IDs,
 reworded plans, and repeated searches do not themselves establish progress.
-Resolve open advice before requesting or publishing another review. Advice is
-optional; after a denied/unavailable review continue independently.
+Acknowledge delivered guidance before another consultation. Once acknowledged,
+you may request follow-up advice or publish a revised plan while earlier advice
+is in progress. Cite new observations when available and explain what remains
+unresolved. Include advice_progress for every open advice ID; a follow-up does
+not validate earlier guidance. Resolve every open item with command evidence
+before submission. Advice is optional; after a denied/unavailable review continue
+independently.
 """
         modes = {"phase3_control": "Automatic plan and recovery advice are disabled.",
                  "plan_review": "Automatic plan review is enabled; recovery advice is disabled.",
@@ -148,6 +164,10 @@ CHECK_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
     "id": {"type": "string", "minLength": 1, "maxLength": 80},
     "kind": {"type": "string", "enum": ["semantic", "environment", "unknown"]},
     "expected": {"type": "string", "enum": ["success", "failure"]}}, "required": ["id", "kind", "expected"]}
+INSPECTION_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    key: {"type": "string", "minLength": 1, "maxLength": 2000}
+    for key in ("explanation", "approach", "alternatives", "missing_evidence")},
+    "required": ["explanation", "approach", "alternatives", "missing_evidence"]}
 
 
 def bounded_refs(value, field):
@@ -164,7 +184,7 @@ def validate_phase3_fields(args):
             raise ValueError("state.uncertainty_question exceeds 4000 characters")
     if "evidence_refs" in state:
         bounded_refs(state["evidence_refs"], "state.evidence_refs")
-    for key, schema in (("progress", LOCAL_PROGRESS_SCHEMA), ("check", CHECK_SCHEMA)):
+    for key, schema in (("progress", LOCAL_PROGRESS_SCHEMA), ("check", CHECK_SCHEMA), ("inspection", INSPECTION_SCHEMA)):
         if key not in args:
             continue
         value = args[key]
@@ -201,11 +221,14 @@ def actor_tools(pending_advice: str | None = None, active_advice: tuple[str, ...
             ("propose_plan", "Publish an actionable hypothesis and approach before implementation.",
              {**{key: {"type": "string", "minLength": 1, "maxLength": 2000}
                   for key in ("hypothesis", "approach", "falsifying_check", "validation_plan")},
-              "evidence_ids": deepcopy(EVIDENCE_SCHEMA)},
-             ["hypothesis", "approach", "falsifying_check", "validation_plan", "evidence_ids"]),
-            ("report_checkpoint", "Answer a recovery checkpoint with a focused question or next experiment.",
+              "evidence_ids": deepcopy(EVIDENCE_SCHEMA),
+              "previous_plan_id": {"type": "string", "maxLength": 80},
+              "change_reason": {"type": "string", "minLength": 1, "maxLength": 2000}},
+             ["hypothesis", "approach", "falsifying_check", "validation_plan", "evidence_ids", "previous_plan_id", "change_reason"]),
+            ("report_checkpoint", "Answer an inspection or recovery checkpoint with reasoning and a next experiment.",
              {"question": {"type": "string", "maxLength": 4000},
               "next_check": {"type": "string", "minLength": 1, "maxLength": 2000},
+              "inspection": deepcopy(INSPECTION_SCHEMA),
               "evidence_ids": deepcopy(EVIDENCE_SCHEMA)}, ["question", "next_check", "evidence_ids"]),
         ])
     for name, description, properties, required in definitions:
@@ -258,8 +281,8 @@ def validate_action(name: str, args: Any, *, advice_enabled=False, phase3_enable
     fields = {"state", "advice_decision", "advice_progress"} | {
         "execute": {"command"}, "submit": {"summary", "validation_refs"},
         "request_advice": {"question", "evidence_ids"},
-        "propose_plan": {"hypothesis", "approach", "evidence_ids", "falsifying_check", "validation_plan"},
-        "report_checkpoint": {"question", "next_check", "evidence_ids"}}[name]
+        "propose_plan": {"hypothesis", "approach", "evidence_ids", "falsifying_check", "validation_plan", "previous_plan_id", "change_reason"},
+        "report_checkpoint": {"question", "next_check", "evidence_ids", "inspection"}}[name]
     if phase3_enabled:
         fields |= {"progress"}
         if name == "execute":
@@ -308,6 +331,11 @@ def validate_action(name: str, args: Any, *, advice_enabled=False, phase3_enable
         _text(args.get("command"), "command")
     elif name in {"propose_plan", "report_checkpoint"}:
         bounded_refs(args.get("evidence_ids"), "evidence_ids")
+        if name == "propose_plan":
+            _text(args.get("previous_plan_id"), "previous_plan_id", empty=True)
+            _text(args.get("change_reason"), "change_reason")
+            if len(args["previous_plan_id"]) > 80 or len(args["change_reason"]) > 2000:
+                raise ValueError("Plan predecessor/reason exceeds its character allowance")
         keys = ("hypothesis", "approach", "falsifying_check", "validation_plan") if name == "propose_plan" else ("question", "next_check")
         for key in keys:
             _text(args.get(key), key, empty=key == "question")
@@ -338,11 +366,6 @@ def validate_advice_context(action: dict, *, pending_advice: str | None,
     for refs in (action["state"].get("evidence_refs", []), action.get("progress", {}).get("evidence_refs", [])):
         if set(refs) - (observation_ids | (patch_ids or set())):
             raise ValueError("Progress or uncertainty contains unknown or unseen evidence IDs")
-    if action["name"] in {"propose_plan", "report_checkpoint"}:
-        unresolved = {key for key, record in records.items() if record["status"] in OPEN_ADVICE_STATUSES}
-        closing = {item["advice_id"] for item in action.get("advice_progress", []) if item["status"] != "in_progress"}
-        if unresolved - closing:
-            raise ValueError("Resolve open advice before publishing another review")
     if pending_advice:
         if not decision or decision["advice_id"] != pending_advice:
             raise ValueError(f"advice_decision for {pending_advice} is required")

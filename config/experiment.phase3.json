@@ -61,6 +61,7 @@
     "advisor_profile": "frontier",
     "task_manifest": "config/sample-24-v2.json",
     "stall_steps": 8,
+    "inspection_steps": 8,
     "failure_threshold": 3,
     "uncertainty_steps": 3,
     "contradiction_steps": 2,
