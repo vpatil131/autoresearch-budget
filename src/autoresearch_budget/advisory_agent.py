@@ -14,9 +14,9 @@ from minisweagent.agents.default import DefaultAgent
 from minisweagent.exceptions import FormatError, Submitted
 
 from .advisor import AdvicePolicy, Advisor, AdvisorUnavailable, SCHEDULED_QUESTION, actor_usage, advice_packet, amount
-from .contracts import CONTRACT_VERSION, PHASE2_CONTRACT_VERSION, PHASE3_CONTRACT_VERSION, actor_prompts, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
+from .contracts import CONTRACT_VERSION, PHASE2_CONTRACT_VERSION, PHASE3_CONTRACT_VERSION, RECOVERY_CONTRACT_VERSION, actor_prompts, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
 from .models import ModelError, RequestOutcomeUnknown
-from .interventions import InterventionCollector
+from .interventions import InterventionCollector, RecoveryCollector, recovery_question
 from .store import RunStore
 
 # Include new, untracked files as well as tracked/staged changes. Git binary patches
@@ -56,7 +56,9 @@ class AdvisoryAgent(DefaultAgent):
         self.pending_advice = None
         self.advice_records: dict[str, dict] = {}
         self.state = {}
-        self.interventions = InterventionCollector(self.policy) if self.policy.phase3 else None
+        collector_type = RecoveryCollector if self.policy.reviews_recovery else InterventionCollector
+        self.interventions = collector_type(self.policy) if self.policy.phase3 else None
+        self.recovery_delivered = False
         self.observation_ids: set[str] = set()
         self.visible_evidence: dict[str, str] = {}
         self.visible_patch_ids: set[str] = set()
@@ -76,7 +78,7 @@ class AdvisoryAgent(DefaultAgent):
         if hasattr(env, "set_time_remaining"):
             env.set_time_remaining(self._command_time_remaining)
         self.advice_store.write_metadata({
-            "contract_version": PHASE3_CONTRACT_VERSION if self.policy.phase3 else (PHASE2_CONTRACT_VERSION if self.policy.policy == "advice_requested" else CONTRACT_VERSION),
+            "contract_version": RECOVERY_CONTRACT_VERSION if self.policy.reviews_recovery else (PHASE3_CONTRACT_VERSION if self.policy.phase3 else (PHASE2_CONTRACT_VERSION if self.policy.policy == "advice_requested" else CONTRACT_VERSION)),
             "policy": {key: value for key, value in self.policy.__dict__.items()
                        if key != "every_steps" or self.policy.policy == "fixed_interval"},
             "advisor": self.advisor_profile, "budget_enforced": False,
@@ -141,6 +143,7 @@ class AdvisoryAgent(DefaultAgent):
         self.model.patch_ids = self.visible_patch_ids
         self.model.advice_enabled = self.policy.actor_requested
         self.model.phase3_enabled = self.policy.phase3
+        self.model.recovery_enabled = self.policy.reviews_recovery
         if self.policy.actor_requested:
             self.add_messages(self.model.format_message(role="user", content=self._capacity_status()))
         return super().query()
@@ -162,11 +165,13 @@ class AdvisoryAgent(DefaultAgent):
                 raise ValueError("Exactly one native action is required")
             action = actions[0]
             validate_action(action["name"], {key: value for key, value in action.items() if key not in {"name", "tool_call_id"}},
-                            advice_enabled=self.policy.actor_requested, phase3_enabled=self.policy.phase3)
+                            advice_enabled=self.policy.actor_requested, phase3_enabled=self.policy.phase3, recovery_enabled=self.policy.reviews_recovery)
             decision = action.get("advice_decision")
             validate_advice_context(action, pending_advice=self.pending_advice,
                                    records=self.advice_records, observation_ids=self.observation_ids, patch_ids=self.visible_patch_ids)
             if self.interventions:
+                if self.policy.reviews_recovery:
+                    self.interventions.validate_recovery(action)
                 if self.interventions.inspection_checkpoint:
                     if action["name"] not in {"propose_plan", "report_checkpoint"}:
                         raise ValueError("Respond to the inspection checkpoint with propose_plan or report_checkpoint before continuing")
@@ -315,10 +320,18 @@ class AdvisoryAgent(DefaultAgent):
             "reasons": reasons, "advice_id": f"advice-{self.advisor_calls}" if self.advisor_calls > before else None,
             "delivered": self.pending_advice is not None, "guidance": guidance,
             "related_advice_ids": related})
+        if self.policy.reviews_recovery:
+            self.recovery_delivered = self.pending_advice is not None
         return guidance
 
     def _finish_checkpoint(self):
         collector = self.interventions
+        if self.policy.reviews_recovery:
+            collector.finish_checkpoint(self.n_calls, reviewed=self.recovery_delivered,
+                                         attempted=True,
+                                         disposition='reviewed' if self.recovery_delivered else 'review_unavailable')
+            self.recovery_delivered = False
+            return
         if collector.checkpoint:
             collector.handled_recovery.add(collector.checkpoint["key"])
         collector.checkpoint = None
@@ -370,6 +383,8 @@ class AdvisoryAgent(DefaultAgent):
             self.advice_store.append_event("checkpoint_response", {"actor_call": self.n_calls, "action": action})
             if not collector.checkpoint:
                 guidance = "No recovery checkpoint is pending. Continue, or request_advice for a focused question."
+            elif self.policy.reviews_recovery:
+                guidance = self._recovery_response(action)
             elif action["question"].strip() and self.policy.reviews_recovery:
                 guidance = self._phase3_consult(action["question"], collector.checkpoint["reasons"], action["evidence_ids"])
                 self._finish_checkpoint()
@@ -403,7 +418,31 @@ class AdvisoryAgent(DefaultAgent):
         collector = self.interventions
         if self._phase3_awaiting_decision():
             return
+        if self.policy.reviews_recovery:
+            collector.refresh_checkpoint_support(self.n_calls, self.state, self.patch_hash)
+            if collector.checkpoint and not collector.checkpoint['reasons']:
+                collector.finish_checkpoint(self.n_calls, disposition='supported_concern_recorded')
+                return
+        if self.policy.reviews_recovery and collector.fallback_ready and collector.checkpoint_resolved():
+            self.advice_store.append_event('recovery_resolution', {'actor_call':self.n_calls,
+                'checkpoint':collector.checkpoint, 'assessment':'collector_progress_or_actor_evidence'})
+            collector.finish_checkpoint(self.n_calls, disposition='resolved_by_experiment')
+            return
         if collector.fallback_ready and collector.checkpoint:
+            if self.policy.reviews_recovery and self.state.get('blocker') == 'environment':
+                self.advice_store.append_event('recovery_deferred', {'actor_call':self.n_calls,
+                    'reason':'environment_blocker', 'checkpoint':collector.checkpoint})
+                collector.fallback_ready = False
+                return
+            if self.policy.reviews_recovery and 'concern_evidence_required' in collector.checkpoint['reasons']:
+                self.advice_store.append_event('recovery_deferred', {'actor_call':self.n_calls,
+                    'reason':'missing_concern_evidence', 'checkpoint':collector.checkpoint})
+                collector.fallback_ready = False
+                collector.fallback_after = self.n_calls
+                self.add_messages(self.model.format_message(role='user', content=(
+                    'Recovery concern still needs a focused question and visible evidence. '
+                    'Use report_checkpoint to supply them before automatic concern advice.')))
+                return
             refs = list(dict.fromkeys([*collector.checkpoint.get("evidence_ids", []), collector.last_observation]))
             question = ("The next experiment did not establish progress. Review the current hypothesis and "
                         "explain what discriminating check should resolve the blocker. Next experiment: "
@@ -422,6 +461,12 @@ class AdvisoryAgent(DefaultAgent):
         if key in collector.handled_recovery:
             return
         collector.checkpoint = {"key": key, "reasons": reasons, "actor_call": self.n_calls}
+        if self.policy.reviews_recovery:
+            collector.checkpoint['concern_id'] = collector.concern and collector.concern['id']
+            collector.checkpoint['failure_check_ids'] = sorted({f['check_id'] for f in collector.failures.values()
+                if f['source_hash'] == self.patch_hash and f['count'] >= self.policy.failure_threshold})
+            collector.checkpoint['failure_checks'] = sorted({(f['check_id'], f['command']) for f in collector.failures.values()
+                if f['source_hash'] == self.patch_hash and f['count'] >= self.policy.failure_threshold})
         collector.checkpoint_announced = True
         # If the actor skips the checkpoint response, its next completed command
         # is the one permitted experiment, not an indefinite exemption from review.
@@ -431,6 +476,31 @@ class AdvisoryAgent(DefaultAgent):
             f"Recovery checkpoint ({', '.join(reasons)}). Use report_checkpoint to give your hypothesis, "
             "supporting/contradicting evidence, a focused unresolved question, and one next_check. "
             "Use an empty question only if the next experiment can resolve the concern independently.")))
+        if self.policy.reviews_recovery and collector.concern:
+            self.add_messages(self.model.format_message(role='user', content=(
+                f"Active recovery concern: {collector.concern['id']}. Supply question and evidence_ids at this "
+                "checkpoint if missing. Reference the concern_id with concern_status='resolved' or 'replace' "
+                "and visible evidence when closing or replacing it.")))
+
+    def _recovery_response(self, action):
+        collector = self.interventions
+        checkpoint = collector.checkpoint
+        collector.refresh_checkpoint_support(self.n_calls, self.state, self.patch_hash)
+        if not checkpoint['reasons']:
+            collector.finish_checkpoint(self.n_calls, disposition='supported_concern_recorded')
+            return 'Concern evidence recorded. Continue the next check; persistence thresholds still apply.'
+        if collector.checkpoint_resolved():
+            collector.finish_checkpoint(self.n_calls, disposition='resolved_by_evidence')
+            return 'Recovery checkpoint resolved with recorded evidence. Continue independently.'
+        question = recovery_question(action['question'])
+        if (question and 'concern_evidence_required' not in checkpoint['reasons']
+                and self.state.get('blocker') != 'environment'):
+            guidance = self._phase3_consult(question, checkpoint['reasons'], action['evidence_ids'])
+            self._finish_checkpoint()
+            return guidance
+        checkpoint.update(next_check=action['next_check'], evidence_ids=action['evidence_ids'])
+        collector.fallback_after = self.n_calls
+        return 'Execute the next check. New output alone does not resolve the concern; the controller will assess the result.'
 
     def _advice_status(self, record):
         self.advice_store.append_event("advice_status", {"actor_call": self.n_calls,
@@ -452,6 +522,8 @@ class AdvisoryAgent(DefaultAgent):
             self.patch_evidence[self.patch_id] = self.advice_store.redact(text)
             if self.interventions:
                 self.interventions.evidence_facts[self.patch_id] = digest
+                if self.policy.reviews_recovery:
+                    self.interventions.candidate_changed(digest, self.n_calls)
             artifact = self.advice_store.write_artifact(self.patch_id, {"patch": text, "sha256": digest})
             self.advice_store.append_event("patch_snapshot", {"actor_call": self.n_calls,
                 "patch_id": self.patch_id, "reason": reason, "artifact": artifact, "sha256": digest})

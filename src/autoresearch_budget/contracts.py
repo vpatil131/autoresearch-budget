@@ -8,6 +8,7 @@ from typing import Any
 CONTRACT_VERSION = "phase1-v2"
 PHASE2_CONTRACT_VERSION = "phase2-v1"
 PHASE3_CONTRACT_VERSION = "phase3-v3"
+RECOVERY_CONTRACT_VERSION = "phase3-recovery-v1"
 ACTOR_SYSTEM = """You solve software engineering issues using the repository and visible checks.
 Own the diagnosis, edits, validation, and submission. Every response must call
 exactly one native tool: execute or submit. Use execute for shell commands;
@@ -116,6 +117,25 @@ independently.
                  "recovery_review": "Automatic recovery review is enabled; plan advice is disabled.",
                  "hybrid": "Automatic plan and recovery review are enabled."}
         system += modes[policy]
+        if policy in {'recovery_review', 'hybrid'}:
+            system += """
+Recovery-v1: The controller tracks activity separately from behavioral progress.
+A candidate edit permits one completed experiment; edit churn is not validation.
+At a recovery checkpoint, supply a concrete question and visible evidence to
+support a concern, or use question='' to defer for the stated next experiment.
+The controller assigns a stable concern_id. Rephrase its question freely while
+the concern is open. Optional state.concern_id references that active concern;
+state.concern_status is open, resolved, or replace. Resolve/replace only with
+state.evidence_refs or checkpoint evidence_ids explaining the resolution or
+replacement. Low uncertainty or successful unrelated checks alone do not close
+a concern. Use replace when a different question needs investigation, and publish
+a revised plan when the causal explanation or approach materially changes.
+Classify regression/validation checks with check.id, kind and expected when
+available; inspection commands can remain unclassified. Keep check IDs stable
+across reruns. The controller ignores known timestamps/durations in failure
+output, while retaining assertion values. Advice delivery does not solve the
+concern; execute its next experiment and report the observed outcome.
+"""
     return system, instance
 
 STATE_SCHEMA = {
@@ -201,7 +221,7 @@ def validate_phase3_fields(args):
                     raise ValueError(f"{key}.{field} exceeds its character allowance")
 
 
-def actor_tools(pending_advice: str | None = None, active_advice: tuple[str, ...] = (), *, advice_enabled=False, phase3_enabled=False) -> list[dict]:
+def actor_tools(pending_advice: str | None = None, active_advice: tuple[str, ...] = (), *, advice_enabled=False, phase3_enabled=False, recovery_enabled=False) -> list[dict]:
     tools = []
     definitions = [
         ("execute", "Execute a shell command in the repository.", {"command": {"type": "string"}}, ["command"]),
@@ -241,6 +261,10 @@ def actor_tools(pending_advice: str | None = None, active_advice: tuple[str, ...
             properties["progress"] = deepcopy(LOCAL_PROGRESS_SCHEMA)
             if name == "execute":
                 properties["check"] = deepcopy(CHECK_SCHEMA)
+            if recovery_enabled:
+                properties['state']['properties'].update({
+                    'concern_id':{'type':'string','minLength':1,'maxLength':80},
+                    'concern_status':{'type':'string','enum':['open','resolved','replace']}})
         if pending_advice:
             schema = deepcopy(DECISION_SCHEMA)
             schema["properties"]["advice_id"]["enum"] = [pending_advice]
@@ -270,7 +294,7 @@ def _refs(value: Any, field: str, *, nonempty: bool = False) -> None:
         raise ValueError(f"{field} must be {'a nonempty' if nonempty else 'an'} array of evidence IDs")
 
 
-def validate_action(name: str, args: Any, *, advice_enabled=False, phase3_enabled=False) -> dict:
+def validate_action(name: str, args: Any, *, advice_enabled=False, phase3_enabled=False, recovery_enabled=False) -> dict:
     enabled = {"execute", "submit"} | ({"request_advice"} if advice_enabled else set())
     if phase3_enabled:
         enabled |= {"propose_plan", "report_checkpoint"}
@@ -291,6 +315,8 @@ def validate_action(name: str, args: Any, *, advice_enabled=False, phase3_enable
         raise ValueError(f"Unexpected tool arguments: {sorted(set(args) - fields)}")
     state = args.get("state")
     state_fields = set(STATE_SCHEMA["properties"]) | ({"uncertainty_question", "evidence_refs"} if phase3_enabled else set())
+    if phase3_enabled and recovery_enabled:
+        state_fields |= {'concern_id','concern_status'}
     if not isinstance(state, dict) or set(state) - state_fields:
         raise ValueError("state must contain only phase, uncertainty, blocker, and optional hypothesis")
     for key in STATE_SCHEMA["required"]:
@@ -300,6 +326,13 @@ def validate_action(name: str, args: Any, *, advice_enabled=False, phase3_enable
         _text(state["hypothesis"], "state.hypothesis", empty=True)
     if phase3_enabled:
         validate_phase3_fields(args)
+        if recovery_enabled:
+            if 'concern_id' in state:
+                _text(state['concern_id'], 'state.concern_id')
+                if len(state['concern_id']) > 80:
+                    raise ValueError('state.concern_id exceeds its character allowance')
+            if 'concern_status' in state and state['concern_status'] not in {'open','resolved','replace'}:
+                raise ValueError('Invalid state.concern_status')
     if "advice_decision" in args:
         decision = args["advice_decision"]
         if not isinstance(decision, dict) or set(decision) - set(DECISION_SCHEMA["properties"]) or set(DECISION_SCHEMA["required"]) - set(decision):
@@ -393,7 +426,7 @@ def validate_advice_context(action: dict, *, pending_advice: str | None,
         raise ValueError("validation_refs contains unknown observation IDs")
 
 
-def parse_actor_response(response: dict, *, advice_enabled=False, phase3_enabled=False) -> dict:
+def parse_actor_response(response: dict, *, advice_enabled=False, phase3_enabled=False, recovery_enabled=False) -> dict:
     choices = response.get("choices") or []
     calls = (choices[0].get("message", {}).get("tool_calls") or []) if choices else []
     if len(calls) != 1:
@@ -402,7 +435,7 @@ def parse_actor_response(response: dict, *, advice_enabled=False, phase3_enabled
     if call.get("type") != "function" or not call.get("id"):
         raise ValueError("A function tool call with an ID is required")
     function = call.get("function") or {}
-    action = validate_action(function.get("name"), json.loads(function.get("arguments", "")), advice_enabled=advice_enabled, phase3_enabled=phase3_enabled)
+    action = validate_action(function.get("name"), json.loads(function.get("arguments", "")), advice_enabled=advice_enabled, phase3_enabled=phase3_enabled, recovery_enabled=recovery_enabled)
     return {**action, "tool_call_id": call["id"]}
 
 

@@ -423,6 +423,129 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertEqual(agent.advisor_calls, 1)
         self.assertEqual(next(e["payload"]["reasons"] for e in self.events(agent) if e["kind"] == "recovery_checkpoint"), ["persistent_uncertainty"])
 
+    def test_recovery_v1_policy_selection_and_contract_isolation(self):
+        from autoresearch_budget.interventions import RecoveryCollector, InterventionCollector
+        base = self.root
+        for mode in ('recovery_review','hybrid','plan_review','phase3_control'):
+            with self.subTest(mode=mode):
+                self.root=base/mode
+                agent=self.agent([response(1),self.finish(2)],policy=mode)
+                self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+                recovery=mode in ('recovery_review','hybrid')
+                self.assertEqual(type(agent.interventions),RecoveryCollector if recovery else InterventionCollector)
+                metadata=json.loads((agent.advice_store.run_dir/'metadata.json').read_text())
+                self.assertEqual(metadata['contract_version'],'phase3-recovery-v1' if recovery else 'phase3-v3')
+                fields=self.requests[0]['tools'][0]['function']['parameters']['properties']['state']['properties']
+                self.assertEqual('concern_id' in fields,recovery)
+        self.root=base
+
+    def test_recovery_v1_noise_and_interleaved_check_preserve_failure(self):
+        command="printf 'AssertionError: expected 2 got 1\\n1 failed in '; date +'%S seconds'; exit 1"
+        actions=[self.failed_check(1,command=command),self.failed_check(2,command=command),
+            response(3,args={'command':'true','state':STATE,'check':{'id':'other','kind':'semantic','expected':'success'}}),
+            self.failed_check(4,command=command),self.checkpoint(5),
+            response(6,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(7,advice_progress=[progress('advice-1','observation-6')])]
+        agent=self.agent(actions,policy='recovery_review',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,1)
+        records=[e['payload'] for e in self.events(agent) if e['kind']=='check_result']
+        self.assertEqual([r['failure_streak'] for r in records],[1,2,0,3])
+        self.assertTrue(all(r['detector_version']=='phase3-recovery-v1' for r in records))
+
+    def test_recovery_v1_deferred_target_pass_resolves_without_advice(self):
+        agent=self.agent([self.failed_check(1),self.failed_check(2),self.failed_check(3),
+            self.checkpoint(4,question='None (run the regression first)'),
+            self.failed_check(5),self.finish(6)],policy='recovery_review',inspection_steps=100)
+        # Simulate the same declared check returning a successful result.
+        original=agent.env.execute
+        def execute(action):
+            if action.get('observation_id')=='observation-5':
+                return {'returncode':0,'output':'Passed','exception_info':''}
+            return original(action)
+        agent.env.execute=execute
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,0)
+        self.assertEqual(agent.interventions.decisions[-1]['disposition'],'resolved_by_experiment')
+
+    def test_recovery_v1_unrelated_pass_still_dispatches_deferred_review(self):
+        agent=self.agent([self.failed_check(1),self.failed_check(2),self.failed_check(3),
+            self.checkpoint(4,question='None (next test can discriminate)'),
+            response(5,args={'command':'true','state':STATE,'check':{'id':'other','kind':'semantic','expected':'success'}}),
+            response(6,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(7,advice_progress=[progress('advice-1','observation-6')])],
+            policy='recovery_review',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,1)
+        requested=next(e['payload'] for e in self.events(agent) if e['kind']=='advice_requested')
+        self.assertEqual(requested['actor_call'],5)
+
+    def test_recovery_v1_missing_support_is_local_then_counts_paraphrases(self):
+        high={**STATE,'phase':'diagnose','uncertainty':'high'}
+        actions=[response(1,args={'command':'true','state':high}),
+            self.checkpoint(2,question='Which cause fits?',state=high),
+            response(3,args={'command':'true','state':{**high,'uncertainty_question':'Why does the cache retain state?',
+                                                     'evidence_refs':['observation-1']}}),
+            response(4,args={'command':'true','state':{**high,'uncertainty_question':'Why is invalidation ineffective?',
+                                                     'evidence_refs':['observation-1']}}),
+            self.checkpoint(5),
+            response(6,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(7,advice_progress=[progress('advice-1','observation-6')])]
+        agent=self.agent(actions,policy='recovery_review',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        checkpoints=[e['payload'] for e in self.events(agent) if e['kind']=='recovery_checkpoint']
+        self.assertEqual([c['reasons'] for c in checkpoints],[['concern_evidence_required'],['persistent_uncertainty']])
+        self.assertEqual([c['concern_id'] for c in checkpoints],['concern-1','concern-1'])
+        self.assertEqual(agent.advisor_calls,1)
+        self.assertEqual(next(e['payload']['actor_call'] for e in self.events(agent) if e['kind']=='advice_requested'),5)
+
+    def test_recovery_v1_mixed_stall_nomination_accepts_support(self):
+        diagnose={**STATE,'phase':'diagnose'}
+        high={**diagnose,'uncertainty':'high'}
+        actions=[response(i,args={'command':'true','state':diagnose}) for i in range(1,9)]
+        actions += [response(9,args={'command':'true','state':high}),self.checkpoint(10,state=high),
+            response(11,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(12,advice_progress=[progress('advice-1','observation-11')])]
+        agent=self.agent(actions,policy='recovery_review',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,1)
+        self.assertEqual(next(e['payload']['reason'] for e in self.events(agent) if e['kind']=='advice_requested'),'stall')
+
+    def test_recovery_v1_unavailable_review_does_not_retry_same_failure(self):
+        agent=self.agent([self.failed_check(1),self.failed_check(2),self.failed_check(3),self.checkpoint(4),
+            self.failed_check(5),self.failed_check(6),self.finish(7)],policy='recovery_review',inspection_steps=100,
+            advisor=self.routed_advisor(fail_both=True))
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,1)
+        self.assertEqual(agent.advisor_failures,1)
+        self.assertEqual(agent.interventions.failure_count,5)
+
+    def test_recovery_v1_explicit_evidence_resolves_contradiction_without_advice(self):
+        conflict={**STATE,'phase':'diagnose','blocker':'conflicting_evidence',
+                  'uncertainty_question':'Why does the cache retain old state?', 'evidence_refs':['observation-1']}
+        agent=self.agent([response(1),response(2,args={'command':'true','state':conflict}),
+            response(3,args={'command':'true','state':{**conflict,'uncertainty_question':'Why is invalidation ineffective?'}}),
+            self.checkpoint(4,question=''),
+            response(5,args={'command':'true','state':{**STATE,'concern_id':'concern-1',
+                        'concern_status':'resolved','evidence_refs':['observation-3']}}),self.finish(6)],
+            policy='recovery_review',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,0)
+        self.assertEqual(next(e['payload']['reasons'] for e in self.events(agent) if e['kind']=='recovery_checkpoint'),
+                         ['conflicting_evidence'])
+        self.assertIsNone(agent.interventions.concern)
+        self.assertEqual(agent.interventions.concern_history[-1]['resolution_evidence'],['observation-3'])
+
+    def test_recovery_v1_environment_blocker_defers_pending_review(self):
+        environment={**STATE,'phase':'diagnose','blocker':'environment'}
+        agent=self.agent([self.failed_check(1),self.failed_check(2),self.failed_check(3),
+            self.checkpoint(4,state=environment),response(5,args={'command':'true','state':environment}),
+            self.finish(6,state=environment)],policy='recovery_review',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,0)
+        self.assertTrue(any(e['kind']=='recovery_deferred' and e['payload']['reason']=='environment_blocker'
+                            for e in self.events(agent)))
+
     def test_phase3_optional_advisor_failure_continues_and_keeps_usage(self):
         agent = self.agent([response(1), self.plan(2), self.finish(3)], policy="hybrid", max_calls=7,
                            advisor=self.routed_advisor(fail_both=True))

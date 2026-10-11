@@ -29,6 +29,7 @@ class StructuredActorModel(OpenRouterModel):
         self.patch_ids: set[str] = set()
         self.advice_enabled = False
         self.phase3_enabled = False
+        self.recovery_enabled = False
 
     def bind(self, store):
         self.store = store
@@ -65,7 +66,7 @@ class StructuredActorModel(OpenRouterModel):
             raise ValueError("Per-call actor overrides are not supported")
         prepared = self._prepare_messages_for_api(messages)
         active = tuple(key for key, record in self.advice_records.items() if record["status"] in OPEN_ADVICE_STATUSES)
-        tools = actor_tools(self.pending_advice, active, advice_enabled=self.advice_enabled, phase3_enabled=self.phase3_enabled)
+        tools = actor_tools(self.pending_advice, active, advice_enabled=self.advice_enabled, phase3_enabled=self.phase3_enabled, recovery_enabled=self.recovery_enabled)
         client = self._client()
         if isinstance(client, OpenRouterClient):
             client.tools = tools
@@ -80,7 +81,7 @@ class StructuredActorModel(OpenRouterModel):
         self._record("actor_completion", {"request_id": request_id, "response": response,
             "duration_seconds": time.monotonic() - started, "cost_usd": cost, "usage": completion.raw_usage})
         try:
-            action = parse_actor_response(response, advice_enabled=self.advice_enabled, phase3_enabled=self.phase3_enabled)
+            action = parse_actor_response(response, advice_enabled=self.advice_enabled, phase3_enabled=self.phase3_enabled, recovery_enabled=self.recovery_enabled)
             validate_advice_context(action, pending_advice=self.pending_advice,
                                    records=self.advice_records, observation_ids=self.observation_ids, patch_ids=self.patch_ids)
         except (ValueError, TypeError, KeyError) as error:
