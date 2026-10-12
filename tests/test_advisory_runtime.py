@@ -165,6 +165,75 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertTrue(any("exactly the open advice" in error for error in errors))
         self.assertTrue(any("before submission" in error for error in errors))
 
+    def test_shared_advice_messages_recover_from_pilot_acknowledgment_errors(self):
+        base = self.root
+        for mode in ('plan_review', 'recovery_review', 'hybrid', 'advice_requested'):
+            with self.subTest(mode=mode):
+                self.root = base / mode
+                prior = [progress('advice-1', None, status='in_progress'),
+                         progress('advice-2', None, status='in_progress')]
+                agent = self.agent([response(1), self.request(2),
+                    response(3, args={'command':'true', 'state':STATE, 'advice_decision':adopt('advice-1')}),
+                    self.request(4, advice_progress=prior[:1]),
+                    response(5, args={'command':'true', 'state':STATE, 'advice_decision':adopt('advice-2'),
+                                     'advice_progress':prior[:1]}),
+                    self.request(6, advice_progress=prior),
+                    response(7, args={'command':'touch rejected-one', 'state':STATE,
+                                     'advice_decision':adopt('advice-3'), 'advice_progress':[
+                                         *prior, progress('advice-3', None, status='in_progress')]}),
+                    response(8, args={'command':'touch rejected-two', 'state':STATE}),
+                    response(9, args={'command':"printf 'after\\n' > tracked.txt", 'state':STATE,
+                                     'advice_decision':adopt('advice-3'), 'advice_progress':prior}),
+                    self.finish(10, advice_progress=[progress(f'advice-{i}', 'observation-9') for i in (1,2,3)])],
+                    policy=mode, max_calls=7, inspection_steps=100, stall_steps=100)
+                self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+                self.assertEqual(agent.advisor_calls, 3)
+                self.assertFalse((self.repo/'rejected-one').exists())
+                self.assertFalse((self.repo/'rejected-two').exists())
+                self.assertEqual((self.repo/'tracked.txt').read_text(), 'after\n')
+                required = 'Progress IDs required this turn: ["advice-1", "advice-2"]'
+                before = self.requests[6]['messages'][-1]['content']
+                self.assertIn('Pending acknowledgment ID: "advice-3"', before)
+                self.assertIn(required, before)
+                self.assertIn('Do not include "advice-3" in advice_progress this turn', before)
+                for index in (7, 8):
+                    errors = [m['content'] for m in self.requests[index]['messages']
+                              if 'not executed or accepted' in (m.get('content') or '')]
+                    self.assertIn(required, errors[-1])
+                    self.assertIn('Pending acknowledgment ID: "advice-3"', errors[-1])
+                after = self.requests[9]['messages'][-1]['content']
+                self.assertIn('Progress IDs required this turn: ["advice-1", "advice-2", "advice-3"]', after)
+                decisions = [e['payload']['actor_call'] for e in self.events(agent)
+                             if e['kind']=='advice_decision' and e['payload']['advice_id']=='advice-3']
+                self.assertEqual(decisions, [9])
+                metadata = json.loads((agent.advice_store.run_dir/'metadata.json').read_text())
+                self.assertEqual(metadata['advice_protocol_version'], 'advice-messaging-v1')
+        self.root = base
+
+    def test_controller_validation_correction_preserves_pending_and_progress_ids(self):
+        from minisweagent.exceptions import FormatError
+        agent = self.agent([], policy='hybrid')
+        agent.pending_advice = 'advice-3'
+        agent.advice_records = {f'advice-{i}': {'status':'acknowledged' if i<3 else 'delivered',
+                                               'actions':[]} for i in (1,2,3)}
+        original = json.loads(json.dumps(agent.advice_records))
+        args = {'command':'touch should-not-execute', 'state':STATE,
+                'advice_decision':adopt('advice-3'), 'advice_progress':[
+                    progress(f'advice-{i}', None, status='in_progress') for i in (1,2,3)]}
+        message = response(1, args=args)['choices'][0]['message']
+        message['extra'] = {'actions':[{'name':'execute', 'tool_call_id':'tool-1', **args}]}
+        with patch.object(agent.env, 'execute') as execute:
+            with self.assertRaises(FormatError) as raised:
+                agent.execute_actions(message)
+            execute.assert_not_called()
+        text = raised.exception.messages[0]['content']
+        self.assertIn('not executed or accepted', text)
+        self.assertIn('Pending acknowledgment ID: "advice-3"', text)
+        self.assertIn('Progress IDs required this turn: ["advice-1", "advice-2"]', text)
+        self.assertEqual(agent.pending_advice, 'advice-3')
+        self.assertEqual(agent.advice_records, original)
+        self.assertEqual(agent.state, {})
+
     def test_phase3_plan_revision_can_review_while_prior_advice_is_in_progress(self):
         agent = self.agent([response(1), self.plan(2),
             response(3, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
@@ -243,6 +312,63 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertEqual(requests[1]["reason"], "repeated_failure")
         self.assertEqual(requests[1]["related_advice_ids"], ["advice-1"])
         self.assertEqual(requests[1]["packet"]["new_observation_ids"], ["observation-5"])
+
+    def test_hybrid_all_recovery_triggers_dispatch_followup_with_open_plan_advice(self):
+        base = self.root
+        diagnose = {**STATE, 'phase':'diagnose'}
+        ongoing = [progress('advice-1', None, status='in_progress')]
+        cases = {'stall':10, 'repeated_failure':5, 'persistent_uncertainty':6, 'conflicting_evidence':5}
+        for reason, trigger_call in cases.items():
+            with self.subTest(reason=reason):
+                self.root = base / reason
+                actions = [response(1), self.plan(2, state=diagnose)]
+                for call in range(3, trigger_call+1):
+                    extra = {'advice_decision':adopt('advice-1')} if call==3 else {'advice_progress':ongoing}
+                    if reason=='repeated_failure':
+                        actions.append(self.failed_check(call, **extra))
+                    else:
+                        state = dict(diagnose)
+                        if call>=4 and reason in {'persistent_uncertainty', 'conflicting_evidence'}:
+                            state.update(uncertainty_question=f'Which cause fits the observation? Report {call}',
+                                         evidence_refs=['observation-3'])
+                            if reason=='persistent_uncertainty':
+                                state.update(uncertainty='high', blocker='missing_information')
+                            else:
+                                state['blocker'] = 'conflicting_evidence'
+                        actions.append(response(call, args={'command':"printf 'still inconclusive'", 'state':state, **extra}))
+                actions.append(self.checkpoint(trigger_call+1, state=diagnose,
+                    evidence_ids=[f'observation-{trigger_call}'], advice_progress=ongoing))
+                resolution = dict(diagnose)
+                if reason in {'persistent_uncertainty', 'conflicting_evidence'}:
+                    resolution.update(concern_id='concern-1', concern_status='resolved',
+                                      evidence_refs=[f'observation-{trigger_call}'])
+                actions.append(response(trigger_call+2, args={'command':'true', 'state':resolution,
+                    'check':{'id':'discriminating-check', 'kind':'semantic', 'expected':'success'},
+                    'advice_decision':adopt('advice-2'), 'advice_progress':ongoing}))
+                actions.append(self.finish(trigger_call+3, state=diagnose,
+                    advice_progress=[progress(f'advice-{i}', f'observation-{trigger_call+2}') for i in (1,2)]))
+                agent = self.agent(actions, policy='hybrid', max_calls=7)
+                self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+                events = self.events(agent)
+                requests = [e['payload'] for e in events if e['kind']=='advice_requested']
+                self.assertEqual([r['reason'] for r in requests], ['plan_review', reason])
+                self.assertEqual(requests[1]['actor_call'], trigger_call+1)
+                self.assertEqual(requests[1]['related_advice_ids'], ['advice-1'])
+                self.assertEqual(requests[1]['packet']['new_observation_ids'], [f'observation-{trigger_call}'])
+                checkpoints = [e['payload'] for e in events if e['kind']=='recovery_checkpoint']
+                self.assertEqual([(c['actor_call'],c['reasons']) for c in checkpoints], [(trigger_call,[reason])])
+                self.assertEqual(agent.advisor_calls, 2)
+                self.assertFalse(any(e['kind']=='actor_schema_error' for e in events))
+                self.assertIsNone(agent.pending_advice)
+                self.assertTrue(all(r['status']=='validated' for r in agent.advice_records.values()))
+                reminder = self.requests[trigger_call+1]['messages'][-1]['content']
+                self.assertIn('Pending acknowledgment ID: "advice-2"', reminder)
+                self.assertIn('Progress IDs required this turn: ["advice-1"]', reminder)
+                if reason=='repeated_failure':
+                    streaks = [e['payload']['failure_streak'] for e in events
+                               if e['kind']=='check_result' and e['payload']['check']['id']=='regression']
+                    self.assertEqual(streaks, [1,2,3])
+        self.root = base
 
     def test_phase3_control_has_common_tools_without_automatic_reviews(self):
         agent = self.agent([response(1), self.plan(2), self.finish(3)], policy="phase3_control", max_calls=7)
@@ -759,6 +885,9 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertIn('advice_decision',pending['required'])
         self.assertEqual(pending['properties']['advice_decision']['properties']['advice_id']['enum'],['advice-1'])
         self.assertIn('advice_progress',self.requests[11]['tools'][0]['function']['parameters']['required'])
+        self.assertIn('Pending acknowledgment ID: "advice-1"', self.requests[10]['messages'][-1]['content'])
+        self.assertIn('Progress IDs required this turn: []', self.requests[10]['messages'][-1]['content'])
+        self.assertIn('Progress IDs required this turn: ["advice-1"]', self.requests[11]['messages'][-1]['content'])
         self.assertTrue(all(r['status']=='validated' for r in agent.advice_records.values()))
 
     def test_submission_at_checkpoint_skips_advice_and_preserves_candidate(self):

@@ -13,7 +13,7 @@ from minisweagent.exceptions import FormatError
 from minisweagent.models.openrouter_model import OpenRouterModel
 
 from .advisor import amount
-from .contracts import OPEN_ADVICE_STATUSES, actor_tools, parse_actor_response, validate_advice_context
+from .contracts import OPEN_ADVICE_STATUSES, actor_tools, parse_actor_response, validate_advice_context, actor_schema_correction
 from .models import OpenRouterClient
 
 
@@ -87,7 +87,8 @@ class StructuredActorModel(OpenRouterModel):
         except (ValueError, TypeError, KeyError) as error:
             self._record("actor_schema_error", {"request_id": request_id, "error": str(error)})
             names = ", ".join(tool["function"]["name"] for tool in tools)
-            raise FormatError({"role": "user", "content": f"Tool schema error: {error}. Use exactly one enabled tool ({names}) with valid structured state.",
+            correction = actor_schema_correction(str(error), pending_advice=self.pending_advice, records=self.advice_records)
+            raise FormatError({"role": "user", "content": f"{correction}\nUse exactly one enabled tool ({names}) with valid structured state.",
                                "extra": {**extra, "interrupt_type": "FormatError"}}) from error
         message = dict(response["choices"][0]["message"])
         message["extra"] = {**extra, "actions": [action]}

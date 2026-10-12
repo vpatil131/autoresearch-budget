@@ -14,7 +14,7 @@ from minisweagent.agents.default import DefaultAgent
 from minisweagent.exceptions import FormatError, Submitted
 
 from .advisor import AdvicePolicy, Advisor, AdvisorUnavailable, SCHEDULED_QUESTION, actor_usage, advice_packet, amount
-from .contracts import CONTRACT_VERSION, PHASE2_CONTRACT_VERSION, PHASE3_CONTRACT_VERSION, RECOVERY_CONTRACT_VERSION, actor_prompts, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
+from .contracts import CONTRACT_VERSION, PHASE2_CONTRACT_VERSION, PHASE3_CONTRACT_VERSION, RECOVERY_CONTRACT_VERSION, ADVICE_PROTOCOL_VERSION, actor_prompts, advice_turn_requirements, actor_schema_correction, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
 from .models import ModelError, RequestOutcomeUnknown
 from .interventions import InterventionCollector, RecoveryCollector, recovery_question
 from .store import RunStore
@@ -79,6 +79,7 @@ class AdvisoryAgent(DefaultAgent):
             env.set_time_remaining(self._command_time_remaining)
         self.advice_store.write_metadata({
             "contract_version": RECOVERY_CONTRACT_VERSION if self.policy.reviews_recovery else (PHASE3_CONTRACT_VERSION if self.policy.phase3 else (PHASE2_CONTRACT_VERSION if self.policy.policy == "advice_requested" else CONTRACT_VERSION)),
+            "advice_protocol_version": ADVICE_PROTOCOL_VERSION,
             "policy": {key: value for key, value in self.policy.__dict__.items()
                        if key != "every_steps" or self.policy.policy == "fixed_interval"},
             "advisor": self.advisor_profile, "budget_enforced": False,
@@ -144,8 +145,12 @@ class AdvisoryAgent(DefaultAgent):
         self.model.advice_enabled = self.policy.actor_requested
         self.model.phase3_enabled = self.policy.phase3
         self.model.recovery_enabled = self.policy.reviews_recovery
-        if self.policy.actor_requested:
-            self.add_messages(self.model.format_message(role="user", content=self._capacity_status()))
+        status = [self._capacity_status()] if self.policy.actor_requested else []
+        requirements = advice_turn_requirements(self.pending_advice, self.advice_records)
+        if requirements:
+            status.append(requirements)
+        if status:
+            self.add_messages(self.model.format_message(role="user", content="\n".join(status)))
         return super().query()
 
     def _capacity_status(self):
@@ -184,7 +189,9 @@ class AdvisoryAgent(DefaultAgent):
             # A parsed assistant tool call is already in the transcript; close it
             # with a tool error rather than leaving an unmatched call in context.
             corrections = self.model.format_observation_messages(message,
-                [{"output": f"Schema error: {error}", "returncode": -1, "exception_info": "schema_validation"}])
+                [{"output": actor_schema_correction(str(error), pending_advice=self.pending_advice,
+                                                    records=self.advice_records),
+                  "returncode": -1, "exception_info": "schema_validation"}])
             raise FormatError(*corrections) from error
         self.state.update(action["state"])
         if self.interventions:

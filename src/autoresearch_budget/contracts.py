@@ -9,6 +9,7 @@ CONTRACT_VERSION = "phase1-v2"
 PHASE2_CONTRACT_VERSION = "phase2-v1"
 PHASE3_CONTRACT_VERSION = "phase3-v3"
 RECOVERY_CONTRACT_VERSION = "phase3-recovery-v1"
+ADVICE_PROTOCOL_VERSION = "advice-messaging-v1"
 ACTOR_SYSTEM = """You solve software engineering issues using the repository and visible checks.
 Own the diagnosis, edits, validation, and submission. Every response must call
 exactly one native tool: execute or submit. Use execute for shell commands;
@@ -385,6 +386,36 @@ def validate_action(name: str, args: Any, *, advice_enabled=False, phase3_enable
         refs = args.get("validation_refs")
         _refs(refs, "validation_refs")
     return {"name": name, **args}
+
+
+def advice_turn_requirements(pending_advice: str | None, records: dict[str, dict]) -> str:
+    """Describe the advice fields required against the pre-action controller state."""
+    active = sorted(key for key, record in records.items() if record["status"] in OPEN_ADVICE_STATUSES)
+    if not pending_advice and not active:
+        return ""
+    lines = ["Advice fields required for this turn (before accepting your action):"]
+    if pending_advice:
+        lines += [f"Pending acknowledgment ID: {json.dumps(pending_advice)}. Include advice_decision for this ID.",
+                  f"Do not include {json.dumps(pending_advice)} in advice_progress this turn; its adopt/modify/reject decision is the acknowledgment."]
+    else:
+        lines.append("No pending acknowledgment. Omit advice_decision.")
+    lines.append(f"Progress IDs required this turn: {json.dumps(active)}.")
+    if active:
+        lines.append("Include advice_progress with exactly one entry for each listed ID, and no other IDs. Use in_progress with evidence_refs=[] if command evidence is unavailable; blocked and resolved statuses require recorded command observations.")
+    else:
+        lines.append("Omit advice_progress this turn.")
+    if pending_advice:
+        lines.append("If adopted/modified, the new ID joins the progress list on the following turn after successful acknowledgment; rejected advice does not join it.")
+    return "\n".join(lines)
+
+
+def actor_schema_correction(error: str, *, pending_advice: str | None, records: dict[str, dict]) -> str:
+    """Give both validation paths the same correction without changing controller state."""
+    text = (f"Schema error: {error}\nThe rejected action was not executed or accepted; "
+            "its advice decision and progress were not recorded. Correct the structured fields "
+            "and resend the action.")
+    requirements = advice_turn_requirements(pending_advice, records)
+    return text + ("\n" + requirements if requirements else "")
 
 
 def validate_advice_context(action: dict, *, pending_advice: str | None,
