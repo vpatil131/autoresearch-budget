@@ -121,6 +121,19 @@ independently.
         if policy in {'recovery_review', 'hybrid'}:
             system += """
 Recovery-v1: The controller tracks activity separately from behavioral progress.
+Automatic recovery has at most one consultation by default. While advice is open,
+another automatic recovery review requires a completed behavioral experiment,
+not more setup or inspection. Label actual experiments with check.kind='semantic'
+and a stable check.id (including expected failing baseline controls). Explicit
+request_advice remains available for concrete obstacles or unresolved results.
+Recovery execution evidence requires a completed direct foreground check, optionally
+`cd DIR && CHECK`, run separately from candidate edits. Pipes, redirects, command
+sequences, and nested shell wrappers have ambiguous check exit status and cannot
+unlock automatic recovery. Keep stdout/stderr capture with the controller. Setup
+or module-resolution failures are environment evidence even if labeled semantic.
+Commands still execute normally; use a direct rerun only when it is meaningful.
+Follow-ups in the same recovery episode supersede earlier recovery IDs only
+after adoption; unfinished validation requirements carry forward, not as proven.
 A candidate edit permits one completed experiment; edit churn is not validation.
 At a recovery checkpoint, supply a concrete question and visible evidence to
 support a concern, or use question='' to defer for the stated next experiment.

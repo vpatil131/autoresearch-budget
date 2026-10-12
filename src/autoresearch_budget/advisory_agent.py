@@ -17,6 +17,7 @@ from .advisor import AdvicePolicy, Advisor, AdvisorUnavailable, SCHEDULED_QUESTI
 from .contracts import CONTRACT_VERSION, PHASE2_CONTRACT_VERSION, PHASE3_CONTRACT_VERSION, RECOVERY_CONTRACT_VERSION, ADVICE_PROTOCOL_VERSION, actor_prompts, advice_turn_requirements, actor_schema_correction, OPEN_ADVICE_STATUSES, validate_action, validate_advice_context, validate_guidance
 from .models import ModelError, RequestOutcomeUnknown
 from .interventions import InterventionCollector, RecoveryCollector, recovery_question
+from .recovery_evidence import RECOVERY_EXECUTION_VERSION, recovery_check_evidence
 from .store import RunStore
 
 # Include new, untracked files as well as tracked/staged changes. Git binary patches
@@ -59,6 +60,8 @@ class AdvisoryAgent(DefaultAgent):
         collector_type = RecoveryCollector if self.policy.reviews_recovery else InterventionCollector
         self.interventions = collector_type(self.policy) if self.policy.phase3 else None
         self.recovery_delivered = False
+        self.automatic_recovery_calls = 0
+        self.last_recovery_deferral = None
         self.observation_ids: set[str] = set()
         self.visible_evidence: dict[str, str] = {}
         self.visible_patch_ids: set[str] = set()
@@ -84,6 +87,7 @@ class AdvisoryAgent(DefaultAgent):
                        if key != "every_steps" or self.policy.policy == "fixed_interval"},
             "advisor": self.advisor_profile, "budget_enforced": False,
             "hidden_verifier_feedback": False, "agent_config": self.config.model_dump(mode="json"),
+            "recovery_consultation_version": RECOVERY_EXECUTION_VERSION if self.policy.reviews_recovery else None,
             "model_config": model.serialize(), "environment_config": env.serialize(),
             "max_observation_chars": max_observation_chars,
         })
@@ -155,8 +159,12 @@ class AdvisoryAgent(DefaultAgent):
 
     def _capacity_status(self):
         remaining = max(0, self.config.step_limit - self.n_calls) if self.config.step_limit else "unlimited"
-        return (f"Actor calls remaining: {remaining}\nAdvisor consultations: {self.advisor_calls} used / "
+        status = (f"Actor calls remaining: {remaining}\nAdvisor consultations: {self.advisor_calls} used / "
                 f"{self.policy.max_calls} maximum; {max(0, self.policy.max_calls - self.advisor_calls)} remaining")
+        if self.policy.reviews_recovery:
+            status += (f"\nAutomatic recovery consultations: {self.automatic_recovery_calls} used / "
+                       f"{self.policy.max_automatic_recovery_calls} maximum. Explicit requests use the overall allowance.")
+        return status
 
     def _deny_advice(self, reason):
         self.advice_denials[reason] = self.advice_denials.get(reason, 0) + 1
@@ -212,6 +220,12 @@ class AdvisoryAgent(DefaultAgent):
             record = self.advice_records[progress["advice_id"]]
             record.update(status=progress["status"], progress=progress)
             self._advice_status(record)
+        if decision and decision["decision"] in {"adopt", "modify"}:
+            for previous in self.advice_records[decision["advice_id"]].get("supersedes", []):
+                record = self.advice_records[previous]
+                if record["status"] in OPEN_ADVICE_STATUSES:
+                    record.update(status="superseded", superseded_by=decision["advice_id"])
+                    self._advice_status(record)
         if self.policy.phase3 and action["name"] in {"propose_plan", "report_checkpoint"}:
             return self._phase3_action(message, action)
         if action["name"] == "request_advice":
@@ -268,19 +282,35 @@ class AdvisoryAgent(DefaultAgent):
         self.visible_evidence[observation_id] = (
             f"returncode={visible.get('returncode')}; exception_info={visible.get('exception_info', '')}; "
             f"output_truncated={len(text) > self.max_observation_chars}\n{visible.get('output', '')}")
+        recovery_evidence = None
         if self.interventions:
             classified = action
             if launch_hash != self.patch_hash and action.get("check"):
                 classified = {**action, "check": {**action["check"], "kind": "unknown"}}
+            if self.policy.reviews_recovery and action.get("check"):
+                recovery_evidence = recovery_check_evidence(action, output,
+                    candidate_changed=launch_hash != self.patch_hash)
+                if not recovery_evidence["eligible"] and action["check"]["kind"] == "semantic":
+                    kind = "environment" if recovery_evidence["reason"] == "observed_environment_failure" else "unknown"
+                    classified = {**action, "check": {**action["check"], "kind": kind}}
             record = self.interventions.observation(classified, visible, self.n_calls, observation_id,
                                                     launch_hash, visible.get("output", ""))
             if record:
+                if recovery_evidence is not None:
+                    record.update(recovery_evidence=recovery_evidence, declared_check=action["check"])
                 self.advice_store.append_event("check_result", {**record,
-                    "completion_source_hash": self.patch_hash, "semantic_assessment": "actor_reported"})
+                    "completion_source_hash": self.patch_hash,
+                    "semantic_assessment": RECOVERY_EXECUTION_VERSION if recovery_evidence is not None else "actor_reported"})
         observations = self.model.format_observation_messages(message, [visible], self.get_template_vars())
         # Advertise the evidence ID without changing the saved raw command output.
         for observation in observations:
             observation["content"] = f"[{observation_id}; {self.patch_id}]\n" + observation["content"]
+            if recovery_evidence and not recovery_evidence["eligible"] and action["check"]["kind"] == "semantic":
+                observation["content"] += (
+                    f"\nThis command ran but is not automatic-recovery behavioral evidence ({recovery_evidence['reason']}). "
+                    "Write/edit the candidate separately, fix any setup error, then run a direct foreground check "
+                    "(optionally cd DIR && CHECK), without pipes, redirects, command sequences or shell wrappers. "
+                    "Do not rerun solely to satisfy bookkeeping; explicit request_advice remains available for a concrete blocker.")
             open_ids = [key for key, record in self.advice_records.items() if record["status"] in OPEN_ADVICE_STATUSES]
             if open_ids:
                 observation["content"] += f"\nOpen advice: {json.dumps(open_ids)}. Include advice_progress for each ID in your next action; cite recorded observations to resolve it."
@@ -291,8 +321,67 @@ class AdvisoryAgent(DefaultAgent):
     def _phase3_awaiting_decision(self):
         return self.pending_advice is not None
 
+    def _automatic_recovery_blocker(self):
+        if self.automatic_recovery_calls >= self.policy.max_automatic_recovery_calls:
+            return "automatic_recovery_limit"
+        active = [r for r in self.advice_records.values() if r["status"] in OPEN_ADVICE_STATUSES]
+        if active:
+            latest = active[-1]
+            # Setup/read commands do not execute the pending behavioral experiment.
+            # Require controller-assessed execution evidence, including full output
+            # and an unambiguous foreground-process exit status.
+            completed = {c["observation_id"] for c in self.interventions.checks
+                         if c.get("recovery_evidence", {}).get("eligible")
+                         and c["actor_call"] > latest.get("delivered_actor_call", 0)}
+            if not completed.intersection(a["observation_id"] for a in latest["actions"]):
+                return "pending_behavioral_experiment"
+        return None
+
+    def _defer_recovery(self, reason, reasons):
+        key = (reason, tuple(r["advice_id"] for r in self.advice_records.values()
+                            if r["status"] in OPEN_ADVICE_STATUSES), self.automatic_recovery_calls)
+        if key == self.last_recovery_deferral:
+            return
+        self.last_recovery_deferral = key
+        self.advice_store.append_event("recovery_deferred", {"actor_call": self.n_calls,
+            "reason": reason, "reasons": reasons, "automatic_recovery_calls": self.automatic_recovery_calls})
+        self.add_messages(self.model.format_message(role="user", content=(
+            f"Automatic recovery deferred ({reason}). Continue the pending experiment; label actual behavioral "
+            "checks with check.kind='semantic' and a stable check.id. Setup/inspection is not experiment evidence. "
+            "Run the check directly, without pipelines/sequences that mask its exit status, after any edits or setup fixes. "
+            "You may explicitly request_advice for a concrete obstacle or unresolved result; acknowledge pending advice first.")))
+
+    def _link_recovery_episode(self, advice_id):
+        record = self.advice_records[advice_id]
+        collector = self.interventions
+        episode = (collector.concern["id"] if collector.concern else
+                   "recovery:" + (collector.plan["plan_id"] if collector.plan else "investigation"))
+        prior = [r for r in self.advice_records.values() if r is not record
+                 and r.get("recovery_episode_id") == episode and r["status"] in OPEN_ADVICE_STATUSES]
+        carry = []
+        for r in prior:
+            carry.extend(r.get("carried_requirements", []))
+            carry.append({"advice_id": r["advice_id"], "validation": r["guidance"]["validation"]})
+        carry = list({item["advice_id"]: item for item in carry}.values())
+        record.update(recovery_episode_id=episode, supersedes=[r["advice_id"] for r in prior],
+                      carried_requirements=carry)
+        self.advice_store.append_event("recovery_episode_revision", {"actor_call": self.n_calls,
+            "advice_id": advice_id, "episode_id": episode, "supersedes": record["supersedes"],
+            "carried_requirements": carry})
+        return carry
+
     def _phase3_consult(self, question, reasons, evidence_ids, *, automatic=True):
+        self.recovery_delivered = False
         reasons = list(dict.fromkeys(reasons))
+        recovery_reasons = {"stall", "repeated_failure", "persistent_uncertainty", "conflicting_evidence"}
+        if self.policy.reviews_recovery and automatic and recovery_reasons.intersection(reasons):
+            blocker = self._automatic_recovery_blocker()
+            if blocker:
+                self._defer_recovery(blocker, reasons)
+                reasons = [r for r in reasons if r not in recovery_reasons]
+                if not reasons:
+                    return "Automatic recovery deferred. Execute the pending experiment or explicitly request focused help."
+        recovery = self.policy.reviews_recovery and bool(recovery_reasons.intersection(reasons))
         refs = list(dict.fromkeys(evidence_ids))[:8]
         related = [key for key, record in self.advice_records.items()
                    if record["status"] in OPEN_ADVICE_STATUSES]
@@ -323,12 +412,23 @@ class AdvisoryAgent(DefaultAgent):
             self.advice_store.append_event("advisor_unavailable_continuation", {
                 "actor_call": self.n_calls, "reasons": reasons})
             guidance = "Advisor unavailable; the failed consultation was recorded. Continue independently."
+        if recovery and automatic and self.advisor_calls > before:
+            self.automatic_recovery_calls += 1
+        episode_followup = self.policy.reviews_recovery and not automatic and (self.interventions.concern or any(
+            r.get("recovery_episode_id") and r["status"] in OPEN_ADVICE_STATUSES
+            for r in self.advice_records.values()))
+        if self.policy.reviews_recovery and self.pending_advice and (recovery or episode_followup):
+            carry = self._link_recovery_episode(self.pending_advice)
+            if carry:
+                guidance += ("\nThis revises the same recovery episode. On adoption, prior recovery IDs are "
+                             "superseded, not validated. Carry these unfinished checks forward or explicitly "
+                             "explain their withdrawal in the current advice progress: " + json.dumps(carry))
         self.advice_store.append_event("intervention_result", {"actor_call": self.n_calls,
             "reasons": reasons, "advice_id": f"advice-{self.advisor_calls}" if self.advisor_calls > before else None,
             "delivered": self.pending_advice is not None, "guidance": guidance,
             "related_advice_ids": related})
         if self.policy.reviews_recovery:
-            self.recovery_delivered = self.pending_advice is not None
+            self.recovery_delivered = recovery and self.pending_advice is not None
         return guidance
 
     def _finish_checkpoint(self):
@@ -425,6 +525,16 @@ class AdvisoryAgent(DefaultAgent):
         collector = self.interventions
         if self._phase3_awaiting_decision():
             return
+        if self.policy.reviews_recovery:
+            blocker = self._automatic_recovery_blocker()
+            if blocker:
+                reasons = collector.checkpoint["reasons"] if collector.checkpoint else collector.reasons(self.n_calls, self.state)
+                if reasons:
+                    self._defer_recovery(blocker, reasons)
+                if blocker == "automatic_recovery_limit" and collector.checkpoint:
+                    collector.finish_checkpoint(self.n_calls, disposition="automatic_recovery_limit")
+                return
+            self.last_recovery_deferral = None
         if self.policy.reviews_recovery:
             collector.refresh_checkpoint_support(self.n_calls, self.state, self.patch_hash)
             if collector.checkpoint and not collector.checkpoint['reasons']:
@@ -616,6 +726,8 @@ class AdvisoryAgent(DefaultAgent):
         self.pending_advice = advice_id
         self.advice_records[advice_id] = {"advice_id": advice_id, "guidance": guidance,
             "status": "delivered", "actions": [], "related_advice_ids": list(related_advice_ids)}
+        if self.policy.reviews_recovery:
+            self.advice_records[advice_id]["delivered_actor_call"] = self.n_calls
         self.advice_store.append_event("advice_delivered", {"actor_call": self.n_calls,
             "advice_id": advice_id, "guidance": guidance, "related_advice_ids": list(related_advice_ids)})
         return f"Advisor guidance ({advice_id}):\n{json.dumps(guidance)}\nInclude advice_decision for {advice_id} in your next action."
@@ -640,6 +752,9 @@ class AdvisoryAgent(DefaultAgent):
             "stop_reason": data["info"].get("exit_status"), "final_patch_id": self.patch_id,
             "duration_seconds": time.monotonic() - self.started}
         metrics["advice_followthrough"] = self.advice_records
+        if self.policy.reviews_recovery:
+            metrics["automatic_recovery_calls"] = self.automatic_recovery_calls
+            metrics["recovery_consultation_version"] = RECOVERY_EXECUTION_VERSION
         if self.interventions:
             metrics["interventions"] = self.interventions.summary()
         data["info"]["poc_metrics"] = metrics

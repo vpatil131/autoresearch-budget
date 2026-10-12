@@ -2,6 +2,8 @@
 import importlib.util
 import json
 import subprocess
+import shlex
+import sys
 import time
 import unittest
 from decimal import Decimal
@@ -121,7 +123,7 @@ class AdvisoryRuntimeTest(unittest.TestCase):
             "evidence_ids": ["observation-1"], "state": STATE, **extra})
 
     def failed_check(self, index, *, kind="semantic", expected="success", **extra):
-        return response(index, args={"command": "printf 'assertion failed'; exit 1",
+        return response(index, args={"command": shlex.quote(sys.executable) + " -c " + shlex.quote("print('assertion failed'); raise SystemExit(1)"),
             "check": {"id": "regression", "kind": kind, "expected": expected},
             "state": {**STATE, "phase": "diagnose"}, **extra})
 
@@ -160,6 +162,7 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertEqual(history[0]["status"], "in_progress")
         self.assertEqual(history[0]["guidance"], GUIDANCE)
         self.assertEqual(agent.advice_records["advice-2"]["related_advice_ids"], ["advice-1"])
+        self.assertNotIn("delivered_actor_call", agent.advice_records["advice-1"])
         self.assertTrue(all(r["status"] == "validated" for r in agent.advice_records.values()))
         errors = [e["payload"]["error"] for e in self.events(agent) if e["kind"] == "actor_schema_error"]
         self.assertTrue(any("exactly the open advice" in error for error in errors))
@@ -317,7 +320,7 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         base = self.root
         diagnose = {**STATE, 'phase':'diagnose'}
         ongoing = [progress('advice-1', None, status='in_progress')]
-        cases = {'stall':10, 'repeated_failure':5, 'persistent_uncertainty':6, 'conflicting_evidence':5}
+        cases = {'stall':11, 'repeated_failure':5, 'persistent_uncertainty':6, 'conflicting_evidence':5}
         for reason, trigger_call in cases.items():
             with self.subTest(reason=reason):
                 self.root = base / reason
@@ -335,7 +338,10 @@ class AdvisoryRuntimeTest(unittest.TestCase):
                                 state.update(uncertainty='high', blocker='missing_information')
                             else:
                                 state['blocker'] = 'conflicting_evidence'
-                        actions.append(response(call, args={'command':"printf 'still inconclusive'", 'state':state, **extra}))
+                        experiment = {'command':shlex.quote(sys.executable) + " -c " + shlex.quote("print('baseline assertion failed'); raise SystemExit(1)"),
+                                      'check':{'id':'baseline', 'kind':'semantic', 'expected':'failure'}} if call==3 else {}
+                        actions.append(response(call, args={'command':"printf 'still inconclusive'", 'state':state,
+                                                           **experiment, **extra}))
                 actions.append(self.checkpoint(trigger_call+1, state=diagnose,
                     evidence_ids=[f'observation-{trigger_call}'], advice_progress=ongoing))
                 resolution = dict(diagnose)
@@ -479,6 +485,121 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertEqual(agent.advisor_calls, 0)
         self.assertTrue(any(e["kind"] == "recovery_checkpoint" for e in self.events(agent)))
 
+    def test_recovery_execution_gate_blocks_vue_style_inspections_then_reviews_experiment(self):
+        high = {**STATE, 'phase':'diagnose', 'uncertainty':'high',
+                'uncertainty_question':'Why do batched updates differ?', 'evidence_refs':['observation-1']}
+        ongoing = [progress('advice-1', '', status='in_progress')]
+        actions = [response(1), self.plan(2),
+            response(3, args={'command':'true', 'state':high, 'advice_decision':adopt('advice-1')})]
+        actions += [response(i, args={'command':"printf 'more inspection'", 'state':high,
+                                     'advice_progress':ongoing}) for i in range(4, 8)]
+        actions += [self.failed_check(8, state=high, advice_progress=ongoing),
+            self.checkpoint(9, state=high, evidence_ids=['observation-8'], advice_progress=ongoing),
+            response(10, args={'command':'true', 'state':STATE, 'advice_decision':adopt('advice-2'),
+                              'advice_progress':ongoing}),
+            self.finish(11, advice_progress=[progress('advice-1','observation-10'),
+                                            progress('advice-2','observation-10')])]
+        agent = self.agent(actions, policy='hybrid', inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        requested = [e['payload'] for e in self.events(agent) if e['kind']=='advice_requested']
+        self.assertEqual([r['actor_call'] for r in requested], [2,9])
+        deferred = [e['payload'] for e in self.events(agent) if e['kind']=='recovery_deferred']
+        self.assertTrue(any(d['reason']=='pending_behavioral_experiment' and d['actor_call']<8 for d in deferred))
+        self.assertEqual(agent.automatic_recovery_calls,1)
+        self.assertFalse(any(e['kind']=='actor_schema_error' for e in self.events(agent)))
+
+    def test_recovery_gate_rejects_masked_module_errors_and_accepts_direct_regression(self):
+        high = {**STATE, 'phase':'diagnose', 'uncertainty':'high',
+                'uncertainty_question':'Why does the DOM retain text?', 'evidence_refs':['observation-1']}
+        ongoing = [progress('advice-1', '', status='in_progress')]
+        setup = shlex.quote(sys.executable) + " -c " + shlex.quote(
+            "print('Error [ERR_MODULE_NOT_FOUND]: Cannot find package puppeteer'); raise SystemExit(1)")
+        actions = [response(1),self.plan(2)]
+        for i,command in enumerate((setup+' | tail -20',setup,'false | cat'),3):
+            extra={'advice_decision':adopt('advice-1')} if i==3 else {'advice_progress':ongoing}
+            actions.append(response(i,args={'command':command,'state':high,
+                'check':{'id':'repro','kind':'semantic','expected':'success'},**extra}))
+        actions += [self.failed_check(6,state=high,advice_progress=ongoing),
+            self.checkpoint(7,state=high,evidence_ids=['observation-6'],advice_progress=ongoing),
+            response(8,args={'command':'true','state':STATE,'advice_decision':adopt('advice-2'),
+                             'advice_progress':ongoing}),
+            self.finish(9,advice_progress=[progress('advice-1','observation-8'),progress('advice-2','observation-8')])]
+        agent=self.agent(actions,policy='hybrid',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        es=self.events(agent)
+        checks=[e['payload'] for e in es if e['kind']=='check_result']
+        self.assertEqual([c['recovery_evidence']['eligible'] for c in checks],[False,False,False,True])
+        self.assertEqual([c['check']['kind'] for c in checks],['environment','environment','unknown','semantic'])
+        self.assertEqual([e['payload']['actor_call'] for e in es if e['kind']=='advice_requested'],[2,7])
+        self.assertFalse(any(e['kind']=='actor_schema_error' for e in es))
+
+    def test_recovery_full_output_filter_does_not_change_plan_review_classification(self):
+        base=self.root
+        command=shlex.quote(sys.executable)+' -c '+shlex.quote(
+            "print('x'*250); print('ModuleNotFoundError: No module named pytest'); print('y'*250); raise SystemExit(1)")
+        for policy in ('hybrid','plan_review'):
+            with self.subTest(policy=policy):
+                self.root=base/policy
+                agent=self.agent([response(1,args={'command':command,'state':STATE,
+                    'check':{'id':'repro','kind':'semantic','expected':'success'}}),self.finish(2)],
+                    policy=policy,inspection_steps=100)
+                self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+                c=next(e['payload'] for e in self.events(agent) if e['kind']=='check_result')
+                if policy=='hybrid':
+                    self.assertEqual(c['recovery_evidence']['reason'],'observed_environment_failure')
+                    self.assertFalse(c['semantic_result'])
+                else:
+                    self.assertNotIn('recovery_evidence',c)
+                    self.assertEqual(c['check']['kind'],'semantic')
+                    self.assertEqual(c['semantic_assessment'],'actor_reported')
+        self.root=base
+
+    def test_recovery_limit_keeps_explicit_followup_and_carries_episode_requirements(self):
+        ongoing = [progress('advice-1', '', status='in_progress')]
+        actions = [self.failed_check(1), self.failed_check(2), self.failed_check(3), self.checkpoint(4),
+                   self.failed_check(5, advice_decision=adopt('advice-1')),
+                   self.failed_check(6, advice_progress=ongoing),
+                   self.failed_check(7, advice_progress=ongoing),
+                   self.request(8, advice_progress=ongoing),
+                   response(9,args={'command':'true','state':STATE,'advice_decision':adopt('advice-2'),
+                                    'advice_progress':ongoing}),
+                   self.finish(10,advice_progress=[progress('advice-2','observation-9')])]
+        agent=self.agent(actions,policy='recovery_review',inspection_steps=100,max_calls=7)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advisor_calls,2)
+        self.assertEqual(agent.automatic_recovery_calls,1)
+        self.assertEqual(agent.advice_records['advice-1']['status'],'superseded')
+        self.assertEqual(agent.advice_records['advice-2']['carried_requirements'],
+                         [{'advice_id':'advice-1','validation':GUIDANCE['validation']}])
+        self.assertTrue(any(e['kind']=='recovery_deferred' and e['payload']['reason']=='automatic_recovery_limit'
+                            for e in self.events(agent)))
+        self.assertFalse(any(e['kind']=='actor_schema_error' for e in self.events(agent)))
+
+    def test_zero_automatic_recovery_allowance_preserves_plan_review(self):
+        agent=self.agent([self.failed_check(1),self.failed_check(2),self.failed_check(3),self.plan(4),
+            response(5,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.finish(6,advice_progress=[progress('advice-1','observation-5')])],
+            policy='hybrid',max_automatic_recovery_calls=0)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        requests=[e['payload'] for e in self.events(agent) if e['kind']=='advice_requested']
+        self.assertEqual([r['reason'] for r in requests],['plan_review'])
+        self.assertEqual(agent.automatic_recovery_calls,0)
+
+    def test_rejected_episode_revision_preserves_previous_open_advice(self):
+        ongoing=[progress('advice-1','',status='in_progress')]
+        reject={'advice_id':'advice-2','decision':'reject','reason':'Evidence rejects this revision',
+                'evidence_refs':['observation-5']}
+        agent=self.agent([self.failed_check(1),self.failed_check(2),self.failed_check(3),self.checkpoint(4),
+            response(5,args={'command':'true','state':STATE,'advice_decision':adopt('advice-1')}),
+            self.request(6,advice_progress=ongoing),
+            response(7,args={'command':'true','state':STATE,'advice_decision':reject,'advice_progress':ongoing}),
+            self.finish(8,advice_progress=[progress('advice-1','observation-7')])],
+            policy='recovery_review',inspection_steps=100)
+        self.assertEqual(agent.run('Issue')['exit_status'],'Submitted')
+        self.assertEqual(agent.advice_records['advice-1']['status'],'validated')
+        self.assertEqual(agent.advice_records['advice-2']['status'],'rejected')
+        self.assertNotIn('superseded_by',agent.advice_records['advice-1'])
+
     def test_phase3_recovery_only_records_plan_and_retains_actor_requests(self):
         agent = self.agent([response(1), self.plan(2), self.request(3),
             response(4, args={"command": "true", "state": STATE, "advice_decision": adopt("advice-1")}),
@@ -566,7 +687,7 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.root=base
 
     def test_recovery_v1_noise_and_interleaved_check_preserve_failure(self):
-        command="printf 'AssertionError: expected 2 got 1\\n1 failed in '; date +'%S seconds'; exit 1"
+        command=shlex.quote(sys.executable) + " -c " + shlex.quote("import time; print('AssertionError: expected 2 got 1\\n1 failed in %s seconds' % time.strftime('%S')); raise SystemExit(1)")
         actions=[self.failed_check(1,command=command),self.failed_check(2,command=command),
             response(3,args={'command':'true','state':STATE,'check':{'id':'other','kind':'semantic','expected':'success'}}),
             self.failed_check(4,command=command),self.checkpoint(5),
@@ -645,6 +766,7 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertEqual(agent.advisor_calls,1)
         self.assertEqual(agent.advisor_failures,1)
         self.assertEqual(agent.interventions.failure_count,5)
+        self.assertEqual(agent.automatic_recovery_calls,1)
 
     def test_recovery_v1_explicit_evidence_resolves_contradiction_without_advice(self):
         conflict={**STATE,'phase':'diagnose','blocker':'conflicting_evidence',

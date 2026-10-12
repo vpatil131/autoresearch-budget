@@ -74,6 +74,7 @@ class AdvicePolicy:
     uncertainty_steps: int = 3
     contradiction_steps: int = 2
     min_actor_calls_remaining: int = 4
+    max_automatic_recovery_calls: int = 1
 
     @property
     def phase3(self) -> bool:
@@ -100,9 +101,9 @@ class AdvicePolicy:
             raise ValueError("every_steps applies only to fixed_interval")
         for key in ("every_steps", "max_calls", "max_context_chars", "max_output_tokens",
                     "stall_steps", "inspection_steps", "failure_threshold", "uncertainty_steps", "contradiction_steps",
-                    "min_actor_calls_remaining"):
+                    "min_actor_calls_remaining", "max_automatic_recovery_calls"):
             number = getattr(config, key)
-            minimum = 0 if key == "max_calls" else 1
+            minimum = 0 if key in {"max_calls", "max_automatic_recovery_calls"} else 1
             if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
                 raise ValueError(f"{key} must be an integer >= {minimum}")
         if config.max_context_chars < 1000:

@@ -56,6 +56,7 @@
   "consultation": {
     "policy": "hybrid",
     "max_calls": 7,
+    "max_automatic_recovery_calls": 1,
     "max_context_chars": 60000,
     "max_output_tokens": 4096,
     "advisor_profile": "frontier",
