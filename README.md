@@ -116,3 +116,19 @@ Reports distinguish outcome, grading status, runner status, known costs, unknown
 - [Contributing and verification](CONTRIBUTING.md): locked environment, offline tests, wheel verification, and artifact handling.
 
 Reproducing an experiment setup does not guarantee identical model outputs or scores. Historical runs require their corresponding runtime revision and archived evidence; those artifacts are distributed separately from this code.
+
+## Citation and attribution
+
+If you use this harness in research, cite the software and include its repository URL and the released version or exact Git commit used:
+
+> Patil, Vashishtha (2026). *Autoresearch on a budget* [Software].
+
+The current package version is `0.1.0` and is in preparation for its first release. Record the task cohort, dataset revision, configuration, and runtime provenance alongside the software citation so others can repeat the setup.
+
+This harness builds on the following projects:
+
+- **[Harbor](https://github.com/harbor-framework/harbor)** provides container environments, task execution, and independent grading. The pinned runtime is `0.23.0`, licensed under [Apache-2.0](https://github.com/harbor-framework/harbor/blob/main/LICENSE). Use Harbor's [software citation](https://github.com/harbor-framework/harbor/blob/main/CITATION.cff) when reporting experiments that use it.
+- **[mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent)** provides the standalone coding agent and the agent loop extended by the advisory controller. The pinned runtime is `2.4.6`, licensed under [MIT](https://github.com/SWE-agent/mini-swe-agent/blob/main/LICENSE.md). Credit the upstream project and record its version.
+- **[SWE-rebench](https://swe-rebench.com/)** supplies the initially supported benchmark. Cite [SWE-rebench: An Automated Pipeline for Task Collection and Decontaminated Evaluation of Software Engineering Agents](https://arxiv.org/abs/2505.20411) (2025), and [SWE-rebench V2: Language-Agnostic SWE Task Collection at Scale](https://arxiv.org/abs/2602.23866) (2026) for V2 tasks. Credit the Harbor dataset publisher, `ibragim-badertdinov`, for the selected `swe-rebench-07-2026` package, and retain its version and revision from the task manifest.
+
+Upstream dependencies, downloaded datasets, container images, and task repositories retain their own licenses and notices. Preserve those notices when redistributing their material; citation complements the applicable license requirements.
