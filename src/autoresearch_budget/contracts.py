@@ -43,40 +43,7 @@ submission command. Report concise reasoning and structured state with each tool
 """
 
 
-def actor_prompts(policy: str, every_steps: int, max_calls: int) -> tuple[str, str]:
-    system = ACTOR_SYSTEM.replace("every 10", f"every {every_steps}")
-    instance = ACTOR_INSTANCE
-    if policy == "actor_only":
-        system = system.replace(f"Optional advisor guidance arrives every {every_steps}\nactor calls.",
-                                "Advisor consultation is disabled for this attempt.")
-    elif policy == "advice_requested":
-        system = ACTOR_SYSTEM.replace("exactly one native tool: execute or submit.",
-                                     "exactly one native tool: execute, request_advice, or submit.")
-        system = system.replace("Optional advisor guidance arrives every 10\nactor calls.", f"""You decide whether and when to consult the advisor. Advice is optional.
-Consider requesting advice early, after initial inspection, when competing
-hypotheses remain or the expected API contract is unclear. Before a substantial
-edit or expensive validation run, consult if an unresolved question could change
-your implementation or validation plan. If two checks fail without clarifying
-the cause, consider consulting with those results instead of repeating the same
-approach. You may consult at other points when a focused uncertainty makes
-progress difficult. Do not wait until most actor calls are spent to raise an
-uncertainty you already recognize. Request only when you can name a question
-whose answer could change your next action; there is no minimum number of calls.
-Ask a specific question and cite observation or patch IDs you have seen in
-evidence_ids.
-Do not delegate the whole task. You own the solution. You have at most {max_calls}
-logical consultations for this attempt; the controller reports remaining
-capacity each turn. Each request consumes one actor turn. There are no scheduled
-consultations. If the limit is reached, continue independently. Acknowledge
-pending guidance before requesting more advice.""")
-        system = system.replace("how this command advances its", "how this action advances its")
-        instance = instance.replace("Use the execute tool for commands and submit for completion.",
-            "Use execute for commands, request_advice for focused consultation, and submit for completion.")
-    if policy in {"phase3_control", "plan_review", "recovery_review", "hybrid"}:
-        system, instance = actor_prompts("advice_requested", every_steps, max_calls)
-        system = system.replace("execute, request_advice, or submit.",
-                                "execute, request_advice, propose_plan, report_checkpoint, or submit.")
-        system += """
+PHASE3_SYSTEM = """
 Phase 3: Before implementing your first actionable diagnosis, use propose_plan
 with hypothesis, approach, evidence_ids, falsifying_check, and validation_plan.
 Every plan includes previous_plan_id (empty for the initial plan, current plan ID
@@ -113,13 +80,7 @@ not validate earlier guidance. Resolve every open item with command evidence
 before submission. Advice is optional; after a denied/unavailable review continue
 independently.
 """
-        modes = {"phase3_control": "Automatic plan and recovery advice are disabled.",
-                 "plan_review": "Automatic plan review is enabled; recovery advice is disabled.",
-                 "recovery_review": "Automatic recovery review is enabled; plan advice is disabled.",
-                 "hybrid": "Automatic plan and recovery review are enabled."}
-        system += modes[policy]
-        if policy in {'recovery_review', 'hybrid'}:
-            system += """
+RECOVERY_SYSTEM = """
 Recovery-v1: The controller tracks activity separately from behavioral progress.
 Automatic recovery has at most one consultation by default. While advice is open,
 another automatic recovery review requires a completed behavioral experiment,
@@ -150,7 +111,80 @@ across reruns. The controller ignores known timestamps/durations in failure
 output, while retaining assertion values. Advice delivery does not solve the
 concern; execute its next experiment and report the observed outcome.
 """
+
+def actor_prompts(policy: str, every_steps: int, max_calls: int) -> tuple[str, str]:
+    if max_calls == 0:
+        return actor_prompts_without_advice(policy)
+    system = ACTOR_SYSTEM.replace("every 10", f"every {every_steps}")
+    instance = ACTOR_INSTANCE
+    if policy == "actor_only":
+        system = system.replace(f"Optional advisor guidance arrives every {every_steps}\nactor calls.",
+                                "Advisor consultation is disabled for this attempt.")
+    elif policy == "advice_requested":
+        system = ACTOR_SYSTEM.replace("exactly one native tool: execute or submit.",
+                                     "exactly one native tool: execute, request_advice, or submit.")
+        system = system.replace("Optional advisor guidance arrives every 10\nactor calls.", f"""You decide whether and when to consult the advisor. Advice is optional.
+Consider requesting advice early, after initial inspection, when competing
+hypotheses remain or the expected API contract is unclear. Before a substantial
+edit or expensive validation run, consult if an unresolved question could change
+your implementation or validation plan. If two checks fail without clarifying
+the cause, consider consulting with those results instead of repeating the same
+approach. You may consult at other points when a focused uncertainty makes
+progress difficult. Do not wait until most actor calls are spent to raise an
+uncertainty you already recognize. Request only when you can name a question
+whose answer could change your next action; there is no minimum number of calls.
+Ask a specific question and cite observation or patch IDs you have seen in
+evidence_ids.
+Do not delegate the whole task. You own the solution. You have at most {max_calls}
+logical consultations for this attempt; the controller reports remaining
+capacity each turn. Each request consumes one actor turn. There are no scheduled
+consultations. If the limit is reached, continue independently. Acknowledge
+pending guidance before requesting more advice.""")
+        system = system.replace("how this command advances its", "how this action advances its")
+        instance = instance.replace("Use the execute tool for commands and submit for completion.",
+            "Use execute for commands, request_advice for focused consultation, and submit for completion.")
+    if policy in {"phase3_control", "plan_review", "recovery_review", "hybrid"}:
+        system, instance = actor_prompts("advice_requested", every_steps, max_calls)
+        system = system.replace("execute, request_advice, or submit.",
+                                "execute, request_advice, propose_plan, report_checkpoint, or submit.")
+        system += PHASE3_SYSTEM
+        modes = {"phase3_control": "Automatic plan and recovery advice are disabled.",
+                 "plan_review": "Automatic plan review is enabled; recovery advice is disabled.",
+                 "recovery_review": "Automatic recovery review is enabled; plan advice is disabled.",
+                 "hybrid": "Automatic plan and recovery review are enabled."}
+        system += modes[policy]
+        if policy in {'recovery_review', 'hybrid'}:
+            system += RECOVERY_SYSTEM
     return system, instance
+
+
+def actor_prompts_without_advice(policy: str) -> tuple[str, str]:
+    """Keep local reasoning contracts without exposing consultation instructions."""
+    prefix, _, validation = ACTOR_SYSTEM.partition(" Optional advisor guidance")
+    validation = "Validate changes using public checks." + validation.split(
+        "Validate changes using public checks.", 1)[1]
+    system = prefix + "\nAdvisor consultation is disabled. Continue independently.\n" + validation
+    if policy in {"phase3_control", "plan_review", "recovery_review", "hybrid"}:
+        system = system.replace("execute or submit.", "execute, propose_plan, report_checkpoint, or submit.")
+        planning = PHASE3_SYSTEM.split("Acknowledge delivered guidance", 1)[0]
+        planning = planning.replace("and may return advice before implementation", "for local reflection before implementation")
+        planning = planning.replace("The controller may consult, or allow that experiment.",
+                                    "Execute the proposed experiment and assess its evidence independently.")
+        system += planning
+    if policy in {"recovery_review", "hybrid"}:
+        system += """
+Recovery-v1: The controller tracks activity separately from behavioral progress.
+Label actual experiments with check.kind='semantic' and a stable check.id
+(including expected failing baseline controls).
+"""
+        evidence = RECOVERY_SYSTEM.split("Recovery execution evidence", 1)[1]
+        before_followups, _, after_followups = evidence.partition("Follow-ups in the same recovery episode")
+        local = "Recovery execution evidence" + before_followups + "A candidate edit" + after_followups.split("A candidate edit", 1)[1]
+        local = local.replace("unlock automatic recovery", "establish recovery execution evidence")
+        local = local.replace("Advice delivery does not solve the\nconcern; execute its next experiment and report the observed outcome.",
+                              "Execute the next experiment and report the observed outcome.")
+        system += local
+    return system, ACTOR_INSTANCE
 
 STATE_SCHEMA = {
     "type": "object", "additionalProperties": False,

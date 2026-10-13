@@ -273,6 +273,32 @@ class BatchTest(unittest.TestCase):
                     self.assertEqual(main(['batch','run','--config',str(config.path),'--batch-dir',str(root/'batch'),*flags]),2)
             self.assertFalse((root/'batch').exists())
 
+    def test_zero_ceiling_cli_retains_hybrid_without_requiring_advisor_profile(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp); config = self.config(root, count=1, paid=False)
+            raw = json.loads(config.path.read_text())
+            del raw['profiles']['frontier']
+            del raw['consultation']['advisor_profile']
+            config.path.write_text(json.dumps(raw))
+            argv = ['batch', 'plan', '--config', str(config.path), '--batch-dir', str(root/'batch'),
+                    '--advice-policy', 'hybrid', '--max-advice-calls', '0']
+            with patch('pathlib.Path.cwd', return_value=root), patch('builtins.print') as printed:
+                self.assertEqual(main(argv), 0)
+            preview = json.loads(printed.call_args.args[0])
+            self.assertFalse(preview['advice_enabled'])
+            self.assertTrue(preview['planning_enabled'])
+            self.assertTrue(preview['recovery_enabled'])
+            self.assertEqual(set(preview['models']), {'actor'})
+            resolved = ExperimentConfig.load(config.path, project_root=root).with_consultation_overrides(
+                policy='hybrid', max_calls=0)
+            settings = json.loads(next(a[7:] for a in self.batch(resolved).runner.command(
+                TrialSpec('owner__repo-0', 'small')) if a.startswith('config=')))
+            self.assertEqual(settings['agent']['advice']['advisor'], {})
+            self.assertFalse((root/'batch').exists())
+            # Re-enabling advice must still validate the advisor route.
+            with self.assertRaises(RunnerConfigError):
+                self.batch(resolved.with_consultation_overrides(max_calls=1))
+
     def test_worker_exception_is_journaled_without_exposing_exception_payload(self):
         with TemporaryDirectory() as temp:
             config = self.config(Path(temp), count=1); runner = self.batch(config)

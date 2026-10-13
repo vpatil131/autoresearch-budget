@@ -57,7 +57,7 @@ async def _mock_run(output: Path) -> dict[str, object]:
 
 def _advice_arguments(command):
     command.add_argument("--advice-policy", choices=sorted(POLICIES), help="override consultation policy")
-    command.add_argument("--max-advice-calls", type=int, help="maximum logical consultations per task attempt; zero disables dispatch")
+    command.add_argument("--max-advice-calls", type=int, help="maximum logical consultations per task attempt; zero removes advice tools and reviews while retaining the policy's planning/checkpoints")
     command.add_argument("--advice-every-steps", type=int, help="actor-call interval; fixed_interval only")
 
 

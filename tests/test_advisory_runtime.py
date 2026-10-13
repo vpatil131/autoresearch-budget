@@ -889,8 +889,8 @@ class AdvisoryRuntimeTest(unittest.TestCase):
         self.assertEqual(agent.n_calls,6)
         self.assertEqual(agent.advice_records['advice-1']['status'],'validated')
 
-    def test_requested_zero_limit_and_last_turn_do_not_dispatch(self):
-        for ceiling,limit,reason in ((0,3,'call_limit'),(7,2,'no_actor_capacity')):
+    def test_requested_last_turn_does_not_dispatch(self):
+        for ceiling,limit,reason in ((7,2,'no_actor_capacity'),):
             with self.subTest(ceiling=ceiling,limit=limit):
                 actions=[response(1),self.request(2)]
                 if limit==3:actions.append(self.finish(3))
@@ -898,6 +898,135 @@ class AdvisoryRuntimeTest(unittest.TestCase):
                 self.assertEqual(agent.run('Issue')['exit_status'],'Submitted' if limit==3 else 'LimitsExceeded')
                 self.assertEqual(agent.advisor_calls,0)
                 self.assertEqual(agent.advice_denials,{reason:1})
+
+    def assert_advice_disabled(self, agent):
+        summary = json.loads((agent.advice_store.run_dir/'summary.json').read_text())
+        self.assertFalse(summary['advice_enabled'])
+        self.assertEqual(summary['advisor']['logical_calls'], 0)
+        self.assertEqual(summary['advisor']['physical_api_calls'], 0)
+        self.assertEqual(summary['advisor']['cost_usd'], '0')
+        self.assertEqual(summary['advice_denials'], {})
+        self.assertEqual(agent.advice_records, {})
+        for event in self.events(agent):
+            self.assertNotIn(event['kind'], {'actor_advice_request', 'advice_requested', 'advice_denied',
+                                           'advice_delivered', 'intervention', 'intervention_result'})
+            self.assertFalse(event['kind'] == 'model_request' and event['payload'].get('model_role') == 'advisor')
+            if event['kind'] in {'model_visible_message', 'visible_observation'}:
+                visible = json.dumps(event['payload'])
+                self.assertNotIn('request_advice', visible)
+                self.assertNotIn('advice_progress', visible)
+        for request in self.requests:
+            self.assertNotIn('request_advice', {t['function']['name'] for t in request['tools']})
+
+    def test_zero_ceiling_all_policies_skip_consultation_and_keep_plans(self):
+        from autoresearch_budget.advisor import POLICIES
+        from autoresearch_budget.interventions import RecoveryCollector
+        base = self.root
+        for mode in sorted(POLICIES):
+            with self.subTest(policy=mode):
+                self.root = base/mode
+                phase3 = mode in {'phase3_control', 'plan_review', 'recovery_review', 'hybrid'}
+                actions = [response(1)]
+                if phase3:
+                    actions += [self.plan(2), self.plan(3, hypothesis='The producer retains stale state',
+                                previous_plan_id='plan-1')]
+                actions += [self.finish(len(actions) + 1)]
+                advisor = Mock(); advisor.consult.side_effect = AssertionError('advisor must never run')
+                agent = self.agent(actions, policy=mode, max_calls=0, advisor=advisor, k=1)
+                with patch.object(agent, '_consult', side_effect=AssertionError('no consultation scheduling')), \
+                     patch.object(agent, '_phase3_consult', side_effect=AssertionError('no review scheduling')):
+                    self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+                advisor.consult.assert_not_called()
+                self.assert_advice_disabled(agent)
+                if phase3:
+                    self.assertEqual(agent.interventions.plan_number, 2)
+                if mode in {'hybrid', 'recovery_review'}:
+                    self.assertIsInstance(agent.interventions, RecoveryCollector)
+                    self.assertTrue(agent.model.recovery_enabled)
+        self.root = base
+
+    def test_zero_ceiling_inspection_is_still_enforced_and_recorded_locally(self):
+        inspection = {'explanation':'Not enough evidence yet', 'approach':'Inspect the consumer',
+                      'alternatives':'Producer or consumer', 'missing_evidence':'Consumer behavior'}
+        agent = self.agent([response(1), response(2),
+            response(3, args={'command':'touch skipped-command', 'state':STATE}),
+            self.checkpoint(4, inspection=inspection), self.plan(5), self.finish(6)],
+            policy='hybrid', max_calls=0, inspection_steps=2)
+        with patch.object(agent, '_phase3_consult', side_effect=AssertionError('no inspection/plan review')):
+            self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        self.assertFalse((self.repo/'skipped-command').exists())
+        self.assertEqual(len(agent.interventions.inspection_responses), 1)
+        self.assertEqual(agent.interventions.plan_number, 1)
+        self.assert_advice_disabled(agent)
+
+    def test_zero_ceiling_recovery_remains_local_even_with_zero_automatic_allowance(self):
+        agent = self.agent([self.failed_check(1), self.failed_check(2), self.failed_check(3),
+            self.checkpoint(4), response(5), self.finish(6)], policy='hybrid', max_calls=0,
+            max_automatic_recovery_calls=0, inspection_steps=100)
+        with patch.object(agent, '_phase3_consult', side_effect=AssertionError('no recovery consultation')):
+            self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        events = self.events(agent)
+        self.assertTrue(any(e['kind'] == 'recovery_checkpoint' for e in events))
+        self.assertTrue(any(e['kind'] == 'checkpoint_response' for e in events))
+        self.assertTrue(any(d['disposition'] == 'local_reflection' for d in agent.interventions.decisions))
+        self.assert_advice_disabled(agent)
+
+    def test_zero_ceiling_stall_reflection_does_not_schedule_or_repeat_review(self):
+        diagnose = {**STATE, 'phase':'diagnose'}
+        agent = self.agent([response(i, args={'command':'true', 'state':diagnose}) for i in range(1,4)] +
+            [self.checkpoint(4, state=diagnose), response(5, args={'command':'true', 'state':diagnose}),
+             self.finish(6, state=diagnose)], policy='hybrid', max_calls=0, stall_steps=2,
+             max_automatic_recovery_calls=0, inspection_steps=100)
+        with patch.object(agent, '_phase3_consult', side_effect=AssertionError('no stall review')):
+            self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        checkpoints = [e['payload'] for e in self.events(agent) if e['kind'] == 'recovery_checkpoint']
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[0]['reasons'], ['stall'])
+        self.assert_advice_disabled(agent)
+
+    def test_zero_ceiling_concern_support_fallback_and_resolution_remain_local(self):
+        high = {**STATE, 'phase':'diagnose', 'uncertainty':'high'}
+        supported = {**high, 'uncertainty_question':'Why is invalidation ineffective?',
+                     'evidence_refs':['observation-1']}
+        agent = self.agent([response(1, args={'command':'true', 'state':high}),
+            self.checkpoint(2, question='', state=high),
+            response(3, args={'command':'true', 'state':high}),
+            self.checkpoint(4, question='Why is invalidation ineffective?', state=high),
+            response(5, args={'command':'true', 'state':supported}),
+            response(6, args={'command':'true', 'state':supported}),
+            self.checkpoint(7, state=supported),
+            response(8, args={'command':'true', 'state':{**STATE, 'concern_id':'concern-1',
+                'concern_status':'resolved', 'evidence_refs':['observation-1']}}),
+            self.finish(9)], policy='hybrid', max_calls=0, inspection_steps=100)
+        with patch.object(agent, '_phase3_consult', side_effect=AssertionError('no concern review')):
+            self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        events = self.events(agent)
+        self.assertTrue(any(e['kind'] == 'recovery_deferred' and
+                            e['payload']['reason'] == 'missing_concern_evidence' for e in events))
+        self.assertIsNone(agent.interventions.concern)
+        self.assertEqual(agent.interventions.concern_history[-1]['status'], 'resolved')
+        self.assert_advice_disabled(agent)
+
+    def test_zero_ceiling_ineligible_check_reminder_does_not_offer_advice(self):
+        agent = self.agent([response(1, args={'command':"printf 'ok' | cat", 'state':STATE,
+            'check':{'id':'regression', 'kind':'semantic', 'expected':'success'}}), self.finish(2)],
+            policy='hybrid', max_calls=0)
+        self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        self.assertTrue(any(e['kind'] == 'check_result' and not e['payload']['recovery_evidence']['eligible']
+                            for e in self.events(agent)))
+        self.assert_advice_disabled(agent)
+
+    def test_zero_ceiling_unadvertised_request_is_rejected_and_dispatch_guards_fail_closed(self):
+        agent = self.agent([response(1), self.request(2), self.finish(3)], policy='hybrid', max_calls=0)
+        self.assertEqual(agent.run('Issue')['exit_status'], 'Submitted')
+        self.assertTrue(any(e['kind'] == 'actor_schema_error' for e in self.events(agent)))
+        # Even a direct/internal call cannot construct a provider or request packet.
+        with patch('autoresearch_budget.advisory_agent.Advisor.from_profile', side_effect=AssertionError('no advisor')):
+            self.assertIn('disabled', agent._consult())
+            self.assertIn('disabled', agent._phase3_consult('Question', ['plan_review'], ['missing']))
+            agent._defer_recovery('automatic_recovery_limit', ['stall'])
+        self.assertEqual(agent.advice_requests, 0)
+        self.assertEqual(agent.advisor_calls, 0)
 
     def test_requested_unknown_evidence_and_pending_guidance_are_rejected(self):
         agent=self.agent([response(1),self.request(2,ids=['observation-999']),

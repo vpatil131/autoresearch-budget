@@ -275,17 +275,18 @@ class HarborTrialRunner:
         if int(self.config.agent.get("max_steps", 0)) < 1:
             raise RunnerConfigError("the advisory POC requires a positive actor call allowance")
         try:
-            AdvicePolicy.load(self.config.consultation)
+            policy = AdvicePolicy.load(self.config.consultation)
         except (TypeError, ValueError) as error:
             raise RunnerConfigError(str(error)) from error
-        advisor = self.config.consultation.get("advisor_profile", "frontier")
-        if advisor not in self.config.profiles:
-            raise RunnerConfigError(f"unknown advisor profile {advisor!r}")
-        profile = self.config.profiles[advisor]
-        try:
-            validate_advisor_routes({"provider": profile.provider, "fallback": profile.fallback})
-        except ValueError as error:
-            raise RunnerConfigError(str(error)) from error
+        if policy.advice_enabled:
+            advisor = self.config.consultation.get("advisor_profile", "frontier")
+            if advisor not in self.config.profiles:
+                raise RunnerConfigError(f"unknown advisor profile {advisor!r}")
+            profile = self.config.profiles[advisor]
+            try:
+                validate_advisor_routes({"provider": profile.provider, "fallback": profile.fallback})
+            except ValueError as error:
+                raise RunnerConfigError(str(error)) from error
         manifest = self.config.consultation.get("task_manifest")
         if not manifest:
             raise RunnerConfigError("the SWE POC requires a frozen task_manifest")
@@ -434,18 +435,21 @@ class HarborTrialRunner:
             "model": {"model_kwargs": model_kwargs},
         }
         if self._scaffold() == self.ADVISORY_SCAFFOLD:
-            advisor = self.config.profiles[self.config.consultation.get("advisor_profile", "frontier")]
+            advisor_config = {}
+            if AdvicePolicy.load(self.config.consultation).advice_enabled:
+                advisor = self.config.profiles[self.config.consultation.get("advisor_profile", "frontier")]
+                advisor_config = {
+                    "model": advisor.model, "reasoning_effort": advisor.reasoning_effort,
+                    "service_tier": advisor.service_tier, "provider": advisor.provider,
+                    "fallback": advisor.fallback,
+                }
             config["agent"].update({
                 "agent_class": "autoresearch_budget.advisory_agent.AdvisoryAgent",
                 "max_observation_chars": int(self.config.agent["max_observation_chars"]),
                 "advice": {
                     **{key: self.config.consultation[key] for key in AdvicePolicy.__dataclass_fields__
                        if key in self.config.consultation},
-                    "advisor": {
-                        "model": advisor.model, "reasoning_effort": advisor.reasoning_effort,
-                        "service_tier": advisor.service_tier, "provider": advisor.provider,
-                        "fallback": advisor.fallback,
-                    },
+                    "advisor": advisor_config,
                     "run_id": self._job_name(spec),
                 },
             })

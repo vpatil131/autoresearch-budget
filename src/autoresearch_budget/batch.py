@@ -164,6 +164,8 @@ class BatchRunner:
         return {"batch_dir": str(self.batch), "concurrency": self.concurrency,
                 "total_tasks": len(self.tasks), "completed_tasks": len(completed),
                 "policy": self.policy.policy, "max_advice_calls": self.policy.max_calls,
+                "advice_enabled": self.policy.advice_enabled,
+                "planning_enabled": self.policy.phase3, "recovery_enabled": self.policy.recovery_enabled,
                 "every_steps": self.policy.every_steps if self.policy.policy == "fixed_interval" else None,
                 "actor_max_steps": self.config.agent["max_steps"],
                 "paid_inference_enabled": self.config.paid_inference_enabled,
@@ -172,8 +174,9 @@ class BatchRunner:
                                   "service_tier": self.config.profiles[name].service_tier,
                                   "reasoning_effort": self.config.profiles[name].reasoning_effort,
                                   "fallback": self.config.profiles[name].fallback}
-                           for role, name in (("actor", self.profile),
-                                              ("advisor", self.config.consultation["advisor_profile"]))},
+                           for role, name in ([("actor", self.profile)] +
+                               ([("advisor", self.config.consultation.get("advisor_profile", "frontier"))]
+                                if self.policy.advice_enabled else []))},
                 "pending": pending, "unresolved_attempts": unresolved,
                 "failed_tasks": sorted(failed), "active_batches": active_batches,
                 "records": records}

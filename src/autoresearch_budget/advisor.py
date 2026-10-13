@@ -81,16 +81,25 @@ class AdvicePolicy:
         return self.policy in PHASE3_POLICIES
 
     @property
+    def advice_enabled(self) -> bool:
+        return self.max_calls > 0 and self.policy != "actor_only"
+
+    @property
+    def recovery_enabled(self) -> bool:
+        """Select the recovery contract independently of consultation capacity."""
+        return self.policy in {"recovery_review", "hybrid"}
+
+    @property
     def actor_requested(self) -> bool:
-        return self.policy == "advice_requested" or self.phase3
+        return self.advice_enabled and (self.policy == "advice_requested" or self.phase3)
 
     @property
     def reviews_plans(self) -> bool:
-        return self.policy in {"plan_review", "hybrid"}
+        return self.advice_enabled and self.policy in {"plan_review", "hybrid"}
 
     @property
     def reviews_recovery(self) -> bool:
-        return self.policy in {"recovery_review", "hybrid"}
+        return self.advice_enabled and self.recovery_enabled
 
     @classmethod
     def load(cls, value: dict[str, Any]) -> "AdvicePolicy":
@@ -113,6 +122,7 @@ class AdvicePolicy:
     def scheduled(self, actor_calls: int, actor_limit: int, last_checkpoint: int) -> bool:
         return (
             self.policy == "fixed_interval"
+            and self.advice_enabled
             and actor_calls > 0
             and actor_calls % self.every_steps == 0
             and actor_calls != last_checkpoint

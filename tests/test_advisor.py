@@ -5,13 +5,40 @@ from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from autoresearch_budget.advisor import AdvicePolicy, advice_packet, validate_advisor_routes
-from autoresearch_budget.contracts import actor_tools, parse_actor_response, validate_guidance, validate_action, validate_advice_context
+from autoresearch_budget.advisor import AdvicePolicy, POLICIES, advice_packet, validate_advisor_routes
+from autoresearch_budget.contracts import actor_prompts, actor_tools, parse_actor_response, validate_guidance, validate_action, validate_advice_context
 from autoresearch_budget.models import OpenRouterClient, RequestOutcomeUnknown
 from autoresearch_budget.store import RunStore
 
 
 class AdvisorContractsTest(unittest.TestCase):
+    def test_zero_ceiling_disables_advice_but_preserves_local_contracts(self):
+        for mode in POLICIES:
+            with self.subTest(policy=mode):
+                policy = AdvicePolicy(policy=mode, max_calls=0)
+                self.assertFalse(policy.advice_enabled)
+                self.assertFalse(policy.actor_requested)
+                self.assertFalse(policy.reviews_plans)
+                self.assertFalse(policy.reviews_recovery)
+                self.assertFalse(policy.scheduled(10, 80, -1))
+                self.assertEqual(policy.recovery_enabled, mode in {'hybrid', 'recovery_review'})
+                system, instance = actor_prompts(mode, 10, 0)
+                self.assertIn('Advisor consultation is disabled', system)
+                for forbidden in ('request_advice', 'advice_decision', 'advice_progress',
+                                  'Automatic plan review is enabled', 'Automatic recovery review is enabled',
+                                  'may return advice', 'may consult', 'Consider requesting advice'):
+                    self.assertNotIn(forbidden, system + instance)
+                self.assertEqual('Phase 3:' in system, policy.phase3)
+                self.assertEqual('Recovery-v1:' in system, policy.recovery_enabled)
+                tools = actor_tools(advice_enabled=policy.actor_requested,
+                                    phase3_enabled=policy.phase3, recovery_enabled=policy.recovery_enabled)
+                names = {t['function']['name'] for t in tools}
+                self.assertNotIn('request_advice', names)
+                if policy.phase3:
+                    self.assertTrue({'propose_plan', 'report_checkpoint'} <= names)
+                fields = tools[0]['function']['parameters']['properties']['state']['properties']
+                self.assertEqual('concern_id' in fields, policy.recovery_enabled)
+
     def test_schedule_boundaries_and_deduplication(self):
         policy = AdvicePolicy()
         self.assertEqual([i for i in range(81) if policy.scheduled(i, 80, -1)], list(range(10, 80, 10)))

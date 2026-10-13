@@ -57,7 +57,7 @@ class AdvisoryAgent(DefaultAgent):
         self.pending_advice = None
         self.advice_records: dict[str, dict] = {}
         self.state = {}
-        collector_type = RecoveryCollector if self.policy.reviews_recovery else InterventionCollector
+        collector_type = RecoveryCollector if self.policy.recovery_enabled else InterventionCollector
         self.interventions = collector_type(self.policy) if self.policy.phase3 else None
         self.recovery_delivered = False
         self.automatic_recovery_calls = 0
@@ -81,13 +81,14 @@ class AdvisoryAgent(DefaultAgent):
         if hasattr(env, "set_time_remaining"):
             env.set_time_remaining(self._command_time_remaining)
         self.advice_store.write_metadata({
-            "contract_version": RECOVERY_CONTRACT_VERSION if self.policy.reviews_recovery else (PHASE3_CONTRACT_VERSION if self.policy.phase3 else (PHASE2_CONTRACT_VERSION if self.policy.policy == "advice_requested" else CONTRACT_VERSION)),
+            "contract_version": RECOVERY_CONTRACT_VERSION if self.policy.recovery_enabled else (PHASE3_CONTRACT_VERSION if self.policy.phase3 else (PHASE2_CONTRACT_VERSION if self.policy.policy == "advice_requested" else CONTRACT_VERSION)),
             "advice_protocol_version": ADVICE_PROTOCOL_VERSION,
             "policy": {key: value for key, value in self.policy.__dict__.items()
                        if key != "every_steps" or self.policy.policy == "fixed_interval"},
             "advisor": self.advisor_profile, "budget_enforced": False,
+            "advice_enabled": self.policy.advice_enabled,
             "hidden_verifier_feedback": False, "agent_config": self.config.model_dump(mode="json"),
-            "recovery_consultation_version": RECOVERY_EXECUTION_VERSION if self.policy.reviews_recovery else None,
+            "recovery_consultation_version": RECOVERY_EXECUTION_VERSION if self.policy.recovery_enabled else None,
             "model_config": model.serialize(), "environment_config": env.serialize(),
             "max_observation_chars": max_observation_chars,
         })
@@ -148,8 +149,8 @@ class AdvisoryAgent(DefaultAgent):
         self.model.patch_ids = self.visible_patch_ids
         self.model.advice_enabled = self.policy.actor_requested
         self.model.phase3_enabled = self.policy.phase3
-        self.model.recovery_enabled = self.policy.reviews_recovery
-        status = [self._capacity_status()] if self.policy.actor_requested else []
+        self.model.recovery_enabled = self.policy.recovery_enabled
+        status = [self._capacity_status()] if self.policy.actor_requested or not self.policy.advice_enabled else []
         requirements = advice_turn_requirements(self.pending_advice, self.advice_records)
         if requirements:
             status.append(requirements)
@@ -159,9 +160,11 @@ class AdvisoryAgent(DefaultAgent):
 
     def _capacity_status(self):
         remaining = max(0, self.config.step_limit - self.n_calls) if self.config.step_limit else "unlimited"
+        if not self.policy.advice_enabled:
+            return f"Actor calls remaining: {remaining}\nAdvisor consultation is disabled; continue independently."
         status = (f"Actor calls remaining: {remaining}\nAdvisor consultations: {self.advisor_calls} used / "
                 f"{self.policy.max_calls} maximum; {max(0, self.policy.max_calls - self.advisor_calls)} remaining")
-        if self.policy.reviews_recovery:
+        if self.policy.recovery_enabled:
             status += (f"\nAutomatic recovery consultations: {self.automatic_recovery_calls} used / "
                        f"{self.policy.max_automatic_recovery_calls} maximum. Explicit requests use the overall allowance.")
         return status
@@ -178,12 +181,12 @@ class AdvisoryAgent(DefaultAgent):
                 raise ValueError("Exactly one native action is required")
             action = actions[0]
             validate_action(action["name"], {key: value for key, value in action.items() if key not in {"name", "tool_call_id"}},
-                            advice_enabled=self.policy.actor_requested, phase3_enabled=self.policy.phase3, recovery_enabled=self.policy.reviews_recovery)
+                            advice_enabled=self.policy.actor_requested, phase3_enabled=self.policy.phase3, recovery_enabled=self.policy.recovery_enabled)
             decision = action.get("advice_decision")
             validate_advice_context(action, pending_advice=self.pending_advice,
                                    records=self.advice_records, observation_ids=self.observation_ids, patch_ids=self.visible_patch_ids)
             if self.interventions:
-                if self.policy.reviews_recovery:
+                if self.policy.recovery_enabled:
                     self.interventions.validate_recovery(action)
                 if self.interventions.inspection_checkpoint:
                     if action["name"] not in {"propose_plan", "report_checkpoint"}:
@@ -234,7 +237,7 @@ class AdvisoryAgent(DefaultAgent):
                 "question": action["question"], "evidence_ids": action["evidence_ids"]})
             if self.policy.phase3:
                 reasons = ["advice_requested"]
-                if self.interventions.checkpoint and self.policy.reviews_recovery:
+                if self.interventions.checkpoint and self.policy.recovery_enabled:
                     reasons += self.interventions.checkpoint["reasons"]
                 guidance = self._phase3_consult(action["question"], reasons, action["evidence_ids"], automatic=False)
                 self._finish_checkpoint()
@@ -287,7 +290,7 @@ class AdvisoryAgent(DefaultAgent):
             classified = action
             if launch_hash != self.patch_hash and action.get("check"):
                 classified = {**action, "check": {**action["check"], "kind": "unknown"}}
-            if self.policy.reviews_recovery and action.get("check"):
+            if self.policy.recovery_enabled and action.get("check"):
                 recovery_evidence = recovery_check_evidence(action, output,
                     candidate_changed=launch_hash != self.patch_hash)
                 if not recovery_evidence["eligible"] and action["check"]["kind"] == "semantic":
@@ -310,7 +313,8 @@ class AdvisoryAgent(DefaultAgent):
                     f"\nThis command ran but is not automatic-recovery behavioral evidence ({recovery_evidence['reason']}). "
                     "Write/edit the candidate separately, fix any setup error, then run a direct foreground check "
                     "(optionally cd DIR && CHECK), without pipes, redirects, command sequences or shell wrappers. "
-                    "Do not rerun solely to satisfy bookkeeping; explicit request_advice remains available for a concrete blocker.")
+                    "Do not rerun solely to satisfy bookkeeping" +
+                    ("; explicit request_advice remains available for a concrete blocker." if self.policy.actor_requested else "."))
             open_ids = [key for key, record in self.advice_records.items() if record["status"] in OPEN_ADVICE_STATUSES]
             if open_ids:
                 observation["content"] += f"\nOpen advice: {json.dumps(open_ids)}. Include advice_progress for each ID in your next action; cite recorded observations to resolve it."
@@ -338,6 +342,8 @@ class AdvisoryAgent(DefaultAgent):
         return None
 
     def _defer_recovery(self, reason, reasons):
+        if not self.policy.advice_enabled:
+            return
         key = (reason, tuple(r["advice_id"] for r in self.advice_records.values()
                             if r["status"] in OPEN_ADVICE_STATUSES), self.automatic_recovery_calls)
         if key == self.last_recovery_deferral:
@@ -371,6 +377,8 @@ class AdvisoryAgent(DefaultAgent):
         return carry
 
     def _phase3_consult(self, question, reasons, evidence_ids, *, automatic=True):
+        if not self.policy.advice_enabled:
+            return "Advisor consultation is disabled; continue independently."
         self.recovery_delivered = False
         reasons = list(dict.fromkeys(reasons))
         recovery_reasons = {"stall", "repeated_failure", "persistent_uncertainty", "conflicting_evidence"}
@@ -381,7 +389,7 @@ class AdvisoryAgent(DefaultAgent):
                 reasons = [r for r in reasons if r not in recovery_reasons]
                 if not reasons:
                     return "Automatic recovery deferred. Execute the pending experiment or explicitly request focused help."
-        recovery = self.policy.reviews_recovery and bool(recovery_reasons.intersection(reasons))
+        recovery = self.policy.recovery_enabled and bool(recovery_reasons.intersection(reasons))
         refs = list(dict.fromkeys(evidence_ids))[:8]
         related = [key for key, record in self.advice_records.items()
                    if record["status"] in OPEN_ADVICE_STATUSES]
@@ -414,10 +422,10 @@ class AdvisoryAgent(DefaultAgent):
             guidance = "Advisor unavailable; the failed consultation was recorded. Continue independently."
         if recovery and automatic and self.advisor_calls > before:
             self.automatic_recovery_calls += 1
-        episode_followup = self.policy.reviews_recovery and not automatic and (self.interventions.concern or any(
+        episode_followup = self.policy.recovery_enabled and not automatic and (self.interventions.concern or any(
             r.get("recovery_episode_id") and r["status"] in OPEN_ADVICE_STATUSES
             for r in self.advice_records.values()))
-        if self.policy.reviews_recovery and self.pending_advice and (recovery or episode_followup):
+        if self.policy.recovery_enabled and self.pending_advice and (recovery or episode_followup):
             carry = self._link_recovery_episode(self.pending_advice)
             if carry:
                 guidance += ("\nThis revises the same recovery episode. On adoption, prior recovery IDs are "
@@ -427,13 +435,19 @@ class AdvisoryAgent(DefaultAgent):
             "reasons": reasons, "advice_id": f"advice-{self.advisor_calls}" if self.advisor_calls > before else None,
             "delivered": self.pending_advice is not None, "guidance": guidance,
             "related_advice_ids": related})
-        if self.policy.reviews_recovery:
+        if self.policy.recovery_enabled:
             self.recovery_delivered = recovery and self.pending_advice is not None
         return guidance
 
     def _finish_checkpoint(self):
         collector = self.interventions
-        if self.policy.reviews_recovery:
+        if self.policy.recovery_enabled:
+            if not self.policy.advice_enabled:
+                if collector.checkpoint:
+                    # Deduplicate the local reflection without counting an advice attempt.
+                    collector.handled_recovery.add(collector.checkpoint['key'])
+                collector.finish_checkpoint(self.n_calls, disposition='local_reflection')
+                return
             collector.finish_checkpoint(self.n_calls, reviewed=self.recovery_delivered,
                                          attempted=True,
                                          disposition='reviewed' if self.recovery_delivered else 'review_unavailable')
@@ -474,6 +488,8 @@ class AdvisoryAgent(DefaultAgent):
                 self._finish_checkpoint()
             else:
                 guidance = f"Recorded {plan['plan_id']}; automatic review disabled or this plan already reviewed. Continue with your next check."
+                if not self.policy.advice_enabled and collector.checkpoint:
+                    self._finish_checkpoint()
             guidance = f"Current plan: {plan['plan_id']}. Reference this ID in previous_plan_id when revising.\n" + guidance
         elif collector.inspection_checkpoint:
             collector.record_inspection(action, self.n_calls)
@@ -489,20 +505,21 @@ class AdvisoryAgent(DefaultAgent):
         else:
             self.advice_store.append_event("checkpoint_response", {"actor_call": self.n_calls, "action": action})
             if not collector.checkpoint:
-                guidance = "No recovery checkpoint is pending. Continue, or request_advice for a focused question."
-            elif self.policy.reviews_recovery:
+                guidance = "No recovery checkpoint is pending. Continue independently."
+                if self.policy.actor_requested:
+                    guidance += " You may request_advice for a focused question."
+            elif self.policy.recovery_enabled:
                 guidance = self._recovery_response(action)
-            elif action["question"].strip() and self.policy.reviews_recovery:
-                guidance = self._phase3_consult(action["question"], collector.checkpoint["reasons"], action["evidence_ids"])
-                self._finish_checkpoint()
             else:
                 collector.checkpoint["next_check"] = action["next_check"]
                 collector.checkpoint["evidence_ids"] = action["evidence_ids"]
                 collector.fallback_after = self.n_calls
                 guidance = "Execute the proposed next check. The controller will assess new evidence before another review."
-                if not self.policy.reviews_recovery:
+                if not self.policy.recovery_enabled:
                     guidance = ("No advisor consultation occurred: automatic recovery review is disabled. "
-                                "Execute the proposed next check, or use request_advice for an unresolved question.")
+                                "Execute the proposed next check.")
+                    if self.policy.actor_requested:
+                        guidance += " You may request_advice for an unresolved question."
                     self._finish_checkpoint()
         observations = self.model.format_observation_messages(message,
             [{"output": guidance, "returncode": 0, "exception_info": ""}], self.get_template_vars())
@@ -535,30 +552,31 @@ class AdvisoryAgent(DefaultAgent):
                     collector.finish_checkpoint(self.n_calls, disposition="automatic_recovery_limit")
                 return
             self.last_recovery_deferral = None
-        if self.policy.reviews_recovery:
+        if self.policy.recovery_enabled:
             collector.refresh_checkpoint_support(self.n_calls, self.state, self.patch_hash)
             if collector.checkpoint and not collector.checkpoint['reasons']:
                 collector.finish_checkpoint(self.n_calls, disposition='supported_concern_recorded')
                 return
-        if self.policy.reviews_recovery and collector.fallback_ready and collector.checkpoint_resolved():
+        if self.policy.recovery_enabled and collector.fallback_ready and collector.checkpoint_resolved():
             self.advice_store.append_event('recovery_resolution', {'actor_call':self.n_calls,
                 'checkpoint':collector.checkpoint, 'assessment':'collector_progress_or_actor_evidence'})
             collector.finish_checkpoint(self.n_calls, disposition='resolved_by_experiment')
             return
         if collector.fallback_ready and collector.checkpoint:
-            if self.policy.reviews_recovery and self.state.get('blocker') == 'environment':
+            if self.policy.recovery_enabled and self.state.get('blocker') == 'environment':
                 self.advice_store.append_event('recovery_deferred', {'actor_call':self.n_calls,
                     'reason':'environment_blocker', 'checkpoint':collector.checkpoint})
                 collector.fallback_ready = False
                 return
-            if self.policy.reviews_recovery and 'concern_evidence_required' in collector.checkpoint['reasons']:
+            if self.policy.recovery_enabled and 'concern_evidence_required' in collector.checkpoint['reasons']:
                 self.advice_store.append_event('recovery_deferred', {'actor_call':self.n_calls,
                     'reason':'missing_concern_evidence', 'checkpoint':collector.checkpoint})
                 collector.fallback_ready = False
                 collector.fallback_after = self.n_calls
                 self.add_messages(self.model.format_message(role='user', content=(
-                    'Recovery concern still needs a focused question and visible evidence. '
-                    'Use report_checkpoint to supply them before automatic concern advice.')))
+                    'Recovery concern still needs a focused question and visible evidence. ' +
+                    ('Use report_checkpoint to supply them before automatic concern advice.' if self.policy.advice_enabled
+                     else 'Use report_checkpoint to supply them, then continue the next check independently.'))))
                 return
             refs = list(dict.fromkeys([*collector.checkpoint.get("evidence_ids", []), collector.last_observation]))
             question = ("The next experiment did not establish progress. Review the current hypothesis and "
@@ -578,7 +596,7 @@ class AdvisoryAgent(DefaultAgent):
         if key in collector.handled_recovery:
             return
         collector.checkpoint = {"key": key, "reasons": reasons, "actor_call": self.n_calls}
-        if self.policy.reviews_recovery:
+        if self.policy.recovery_enabled:
             collector.checkpoint['concern_id'] = collector.concern and collector.concern['id']
             collector.checkpoint['failure_check_ids'] = sorted({f['check_id'] for f in collector.failures.values()
                 if f['source_hash'] == self.patch_hash and f['count'] >= self.policy.failure_threshold})
@@ -593,7 +611,7 @@ class AdvisoryAgent(DefaultAgent):
             f"Recovery checkpoint ({', '.join(reasons)}). Use report_checkpoint to give your hypothesis, "
             "supporting/contradicting evidence, a focused unresolved question, and one next_check. "
             "Use an empty question only if the next experiment can resolve the concern independently.")))
-        if self.policy.reviews_recovery and collector.concern:
+        if self.policy.recovery_enabled and collector.concern:
             self.add_messages(self.model.format_message(role='user', content=(
                 f"Active recovery concern: {collector.concern['id']}. Supply question and evidence_ids at this "
                 "checkpoint if missing. Reference the concern_id with concern_status='resolved' or 'replace' "
@@ -611,7 +629,7 @@ class AdvisoryAgent(DefaultAgent):
             return 'Recovery checkpoint resolved with recorded evidence. Continue independently.'
         question = recovery_question(action['question'])
         if (question and 'concern_evidence_required' not in checkpoint['reasons']
-                and self.state.get('blocker') != 'environment'):
+                and self.state.get('blocker') != 'environment' and self.policy.reviews_recovery):
             guidance = self._phase3_consult(question, checkpoint['reasons'], action['evidence_ids'])
             self._finish_checkpoint()
             return guidance
@@ -639,7 +657,7 @@ class AdvisoryAgent(DefaultAgent):
             self.patch_evidence[self.patch_id] = self.advice_store.redact(text)
             if self.interventions:
                 self.interventions.evidence_facts[self.patch_id] = digest
-                if self.policy.reviews_recovery:
+                if self.policy.recovery_enabled:
                     self.interventions.candidate_changed(digest, self.n_calls)
             artifact = self.advice_store.write_artifact(self.patch_id, {"patch": text, "sha256": digest})
             self.advice_store.append_event("patch_snapshot", {"actor_call": self.n_calls,
@@ -672,6 +690,8 @@ class AdvisoryAgent(DefaultAgent):
 
     def _consult(self, *, question=SCHEDULED_QUESTION, reason="fixed_interval", evidence_ids=(),
                  related_advice_ids=(), new_observation_ids=()):
+        if not self.policy.advice_enabled:
+            return "Advisor consultation is disabled; continue independently."
         if self.advisor_calls >= self.policy.max_calls:
             return self._deny_advice("call_limit")
         cited = {ref: self.visible_evidence[ref] if ref in self.visible_evidence else self.patch_evidence[ref]
@@ -726,7 +746,7 @@ class AdvisoryAgent(DefaultAgent):
         self.pending_advice = advice_id
         self.advice_records[advice_id] = {"advice_id": advice_id, "guidance": guidance,
             "status": "delivered", "actions": [], "related_advice_ids": list(related_advice_ids)}
-        if self.policy.reviews_recovery:
+        if self.policy.recovery_enabled:
             self.advice_records[advice_id]["delivered_actor_call"] = self.n_calls
         self.advice_store.append_event("advice_delivered", {"actor_call": self.n_calls,
             "advice_id": advice_id, "guidance": guidance, "related_advice_ids": list(related_advice_ids)})
@@ -744,6 +764,7 @@ class AdvisoryAgent(DefaultAgent):
             "prompt_tokens": self.advisor_prompt_tokens, "completion_tokens": self.advisor_completion_tokens}
         total = str(Decimal(actor["cost_usd"]) + Decimal(advisor["cost_usd"])) if actor["cost_usd"] is not None and advisor["cost_usd"] is not None else None
         metrics = {"run_id": self.advice_store.run_id, "policy": self.policy.policy,
+            "advice_enabled": self.policy.advice_enabled,
             "every_steps": self.policy.every_steps if self.policy.policy == "fixed_interval" else None,
             "max_advice_calls": self.policy.max_calls, "advice_requests": self.advice_requests,
             "advice_calls_remaining": max(0, self.policy.max_calls - self.advisor_calls),
@@ -752,7 +773,7 @@ class AdvisoryAgent(DefaultAgent):
             "stop_reason": data["info"].get("exit_status"), "final_patch_id": self.patch_id,
             "duration_seconds": time.monotonic() - self.started}
         metrics["advice_followthrough"] = self.advice_records
-        if self.policy.reviews_recovery:
+        if self.policy.recovery_enabled:
             metrics["automatic_recovery_calls"] = self.automatic_recovery_calls
             metrics["recovery_consultation_version"] = RECOVERY_EXECUTION_VERSION
         if self.interventions:
