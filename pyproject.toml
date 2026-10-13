@@ -7,6 +7,8 @@ name = "autoresearch-budget"
 version = "0.1.0"
 description = "Research harness for bounded advice in coding-agent experiments"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 classifiers = ["Development Status :: 3 - Alpha", "Programming Language :: Python :: 3", "Operating System :: POSIX"]
 requires-python = ">=3.12"
 dependencies = []

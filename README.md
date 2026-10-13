@@ -132,3 +132,7 @@ This harness builds on the following projects:
 - **[SWE-rebench](https://swe-rebench.com/)** supplies the initially supported benchmark. Cite [SWE-rebench: An Automated Pipeline for Task Collection and Decontaminated Evaluation of Software Engineering Agents](https://arxiv.org/abs/2505.20411) (2025), and [SWE-rebench V2: Language-Agnostic SWE Task Collection at Scale](https://arxiv.org/abs/2602.23866) (2026) for V2 tasks. Credit the Harbor dataset publisher, `ibragim-badertdinov`, for the selected `swe-rebench-07-2026` package, and retain its version and revision from the task manifest.
 
 Upstream dependencies, downloaded datasets, container images, and task repositories retain their own licenses and notices. Preserve those notices when redistributing their material; citation complements the applicable license requirements.
+
+## License
+
+The harness code is licensed under the [MIT License](LICENSE). The upstream materials credited above retain their own licenses.
