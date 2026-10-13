@@ -13,7 +13,7 @@ jobs_dir=${HARBOR_SMOKE_JOBS_DIR:-runs/harbor-smoke}
 
 for agent in nop oracle; do
     "$script_dir/with_anonymous_docker.sh" \
-        uvx harbor run \
+        uvx harbor==0.23.0 run \
         --path "$task_dir" \
         --agent "$agent" \
         --n-concurrent 1 \

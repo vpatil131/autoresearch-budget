@@ -1,0 +1,50 @@
+name: Offline verification
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+env:
+  MSWEA_SILENT_STARTUP: '1'
+  LITELLM_LOCAL_MODEL_COST_MAP: 'True'
+jobs:
+  lightweight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.11.6'
+          python-version: '3.12'
+      - run: uv venv --python 3.12
+      - run: uv pip install .
+      - run: .venv/bin/python scripts/check_tests.py
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.12', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.11.6'
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --extra runtime --python '${{ matrix.python }}'
+      - run: uv run --locked --extra runtime python scripts/check_tests.py --require-runtime
+      - run: uv build
+      - name: Verify installed wheel
+        shell: bash
+        run: |
+          uv venv '/tmp/autoresearch wheel check' --python '${{ matrix.python }}'
+          uv export --quiet --locked --extra runtime --no-dev --no-emit-project --output-file /tmp/autoresearch-runtime.txt
+          uv pip install --python '/tmp/autoresearch wheel check/bin/python' -r /tmp/autoresearch-runtime.txt
+          uv pip install --python '/tmp/autoresearch wheel check/bin/python' --no-deps dist/*.whl
+          '/tmp/autoresearch wheel check/bin/python' scripts/verify_install.py

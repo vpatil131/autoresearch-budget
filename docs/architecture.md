@@ -54,7 +54,7 @@ Advisory execution currently requires `budget.enforce=false` and a zero mini-SWE
 
 `trial` schedules independent attempts with up to eight workers. Advisory `batch` execution supports up to six workers and persists claims before dispatch, then collects terminal records. Runner/integration failures stop new scheduling while active work finishes; benchmark zero rewards remain valid outcomes.
 
-Batch configuration and task selection are fingerprinted; source files are snapshotted for dispatch. Resumption skips valid completed tasks, reconciles terminal claims, and rejects changed settings or ambiguous attempts. A `drain.request` file stops new scheduling without terminating active attempts.
+Batch configuration, task selection, package contents and runtime identity are fingerprinted; source files are snapshotted for dispatch. Resumption skips valid completed tasks, reconciles terminal claims, and rejects changed settings or ambiguous attempts. `batch drain` writes a `drain.request` flag to stop new scheduling without terminating active attempts. Host claims protect all scaffolds from duplicate attempt dispatch, and host metadata records task/package/runtime provenance.
 
 ## Extending configuration
 
@@ -63,3 +63,9 @@ Model profiles specify model IDs, provider routing, reasoning, service tier, and
 Task manifests need a `tasks` array of distinct `task_id` values. Each ID names a downloaded Harbor task directory. The included manifest also retains repository, language, commit, image, and dataset provenance; observed outcomes and historical run identifiers are excluded.
 
 Policy changes may require corresponding actor tools, validation, evidence collectors, and offline runtime tests. Sandbox-installed advisory modules are explicitly listed in `AdvisoryMiniSweAgent.SOURCE_FILES`; dependency coverage is checked by the sandbox-package test.
+
+## Installed workflow and reporting
+
+Packaged templates support `init`; `doctor` validates the execution environment without inference. `demo` injects scripted transports into the production advisory controller and runs a tiny public regression fixture. The Docker wrapper is an installed Python module, and batch snapshots copy actual runtime modules. Configurations with `workspace` anchor their relative paths to the config file.
+
+`dataset inspect` validates external task packages and records aggregate content hashes. `report` reads host/Harbor artifacts with relative evidence links; `compare` requires unique matched task identities and surfaces configuration and provenance differences. Neither command executes tasks or makes inference requests. See [configuration](configuration.md) and [execution/reporting](usage.md).
