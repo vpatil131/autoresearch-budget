@@ -1,26 +1,28 @@
+# Credentials and local configuration
 .env
 .env.*
 !.env.example
+config/*.local.json
+
+# Python environments and caches
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Downloaded datasets, dependencies, and generated experiment output
 data/raw/
 data/harbor/
 data/manifests/
 runs/
 logs/
 vendor/
-config/experiment.local.json
-config/*.local.json
-.chart-data-*/
-/analysis/
-/research/
-/LLMDay-Austin-Oct10/
-/docs/publication_plan.md
-/docs/*speaker-notes*.md
 /experiment/
-dist/
-build/
-*.egg-info/
+
+# Operating system files
+.DS_Store
