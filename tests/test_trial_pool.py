@@ -91,7 +91,8 @@ class TrialPoolTest(unittest.TestCase):
                 self.assertEqual(TrialPool(runner, specs, workers=2).run(report), 1)
             self.assertEqual(set(seen), {spec.task_id for spec in specs[:2]})
             self.assertEqual(len(reports), 2)
-            self.assertIn("offline startup failure", reports[0]["error"])
+            self.assertEqual("RunnerConfigError", reports[0]["error"])
+            self.assertNotIn("offline startup failure", json.dumps(reports))
 
     def test_invalid_workers_and_duplicates_cannot_dispatch(self):
         with TemporaryDirectory() as temp:

@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import time
+import sys
 from dataclasses import dataclass, field, replace
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
@@ -16,6 +17,8 @@ from typing import Any
 from .budget import BudgetLedger
 from .advisor import AdvicePolicy, validate_advisor_routes
 from .store import RunStore
+from .provenance import trial_provenance, package_hash
+from .processes import run_command
 
 
 class RunnerConfigError(ValueError):
@@ -74,17 +77,21 @@ class ExperimentConfig:
         return replace(self, consultation=consultation)
 
     @classmethod
-    def load(cls, path: str | Path, *, project_root: str | Path) -> "ExperimentConfig":
+    def load(cls, path: str | Path, *, project_root: str | Path | None = None) -> "ExperimentConfig":
         config_path = Path(path).resolve()
-        root = Path(project_root).resolve()
         raw = json.loads(config_path.read_text(encoding="utf-8"))
+        _validate_config(raw)
+        # Explicit API root wins. New configs pin their workspace relative to the
+        # config file; legacy configs retain their invocation-directory behavior.
+        root = (Path(project_root).resolve() if project_root is not None else
+                _under_root(config_path.parent, raw["workspace"]) if "workspace" in raw else Path.cwd().resolve())
         budget = raw["budget"]
         locations = raw.get("locations", {})
         profiles = {
             name: ModelProfile(
                 name=name,
                 model=value["model"],
-                run_max_cost_usd=Decimal(str(value["run_max_cost_usd"])),
+                run_max_cost_usd=Decimal(str(value.get("run_max_cost_usd", 0))),
                 reasoning_effort=value.get("reasoning_effort"),
                 service_tier=value.get("service_tier"),
                 provider=value.get("provider"),
@@ -96,7 +103,7 @@ class ExperimentConfig:
             path=config_path,
             project_root=root,
             budget_db=_under_root(root, budget["ledger"]),
-            budget_cap_usd=Decimal(str(budget["cap_usd"])),
+            budget_cap_usd=Decimal(str(budget.get("cap_usd", 0))),
             task_root=_under_root(
                 root,
                 locations.get(
@@ -138,9 +145,9 @@ class HarborTrialRunner:
     ) -> list[str]:
         if spec.profile not in self.config.profiles:
             raise RunnerConfigError(f"unknown model profile {spec.profile!r}")
-        if spec.attempt < 1:
+        if type(spec.attempt) is not int or spec.attempt < 1:
             raise RunnerConfigError("attempt must be at least 1")
-        if "/" in spec.task_id or spec.task_id in (".", ".."):
+        if not _directory_name(spec.task_id):
             raise RunnerConfigError("task_id must be one task directory name")
         profile = self.config.profiles[spec.profile]
         task_dir = task_dir or self.config.task_root / spec.task_id
@@ -191,14 +198,12 @@ class HarborTrialRunner:
             )
         # Validate the complete plan before staging or dispatch.
         self.command(spec)
-        if self._scaffold() == self.ADVISORY_SCAFFOLD:
-            name = self._job_name(spec)
-            if (self.config.jobs_root / name).exists() or (self.config.jobs_root / "_poc_records" / name).exists():
-                raise RunnerConfigError("POC attempt already exists; use a new attempt number to preserve its records")
+        name = self._job_name(spec)
+        if (self.config.jobs_root / name).exists() or (self.config.jobs_root / "_poc_records" / name).exists() or (self.config.jobs_root / "_run_records" / name).exists():
+            raise RunnerConfigError("trial attempt already exists; use a new attempt number to preserve its records")
         task_dir = self.config.task_root / spec.task_id
         if not task_dir.is_dir():
             raise RunnerConfigError(f"task directory does not exist: {task_dir}")
-        prepared_task_dir = self._prepare_task(spec, task_dir)
         environment = dict(os.environ)
         environment.update(_read_env_file(self.config.project_root / env_file))
         api_key = environment.get("OPENROUTER_API_KEY") or environment.get(
@@ -210,17 +215,52 @@ class HarborTrialRunner:
             )
         environment["OPENROUTER_API_KEY"] = api_key
         existing_pythonpath = environment.get("PYTHONPATH")
-        source_path = str(source_root or self.config.project_root / "src")
+        source_path = str(source_root or Path(__file__).resolve().parent.parent)
         environment["PYTHONPATH"] = (
             source_path + os.pathsep + existing_pythonpath
             if existing_pythonpath
             else source_path
         )
-        self.config.jobs_root.mkdir(parents=True, exist_ok=True)
+        record_dir = self.config.jobs_root / ("_poc_records" if self._scaffold() == self.ADVISORY_SCAFFOLD else "_run_records") / name
+        record_dir.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive host claim protects all scaffolds, including simultaneous
+        # invocations racing before Harbor has created its job directory.
+        try:
+            record_dir.mkdir()
+        except FileExistsError:
+            raise RunnerConfigError("trial attempt already claimed; use a new attempt") from None
+        secrets = tuple(value for key, value in environment.items()
+                        if any(word in key.upper() for word in ("API_KEY", "TOKEN", "PASSWORD", "OPENROUTER_KEY")))
+        store = RunStore(record_dir, secrets=secrets)
+        store_meta = {"task_id": spec.task_id, "profile": spec.profile, "attempt": spec.attempt,
+                              "configuration": self.config.resolved_config(),
+                              "budget_enforced": self.config.budget_enforced,
+                              "provenance": trial_provenance(self.config, task_dir, source_root)}
+        store.write_metadata(store_meta)
+        started = time.monotonic()
+        code = None
+        try:
+            prepared_task_dir = self._prepare_task(spec, task_dir, expected_sha256=store_meta["provenance"]["task_package_sha256"])
+            code = self._dispatch(spec, prepared_task_dir, environment, store)
+            return code
+        except BaseException as error:
+            store.write_summary({"status": "interrupted" if isinstance(error, (KeyboardInterrupt, InterruptedError)) else "runner_error",
+                                 "exception_type": type(error).__name__, "return_code": None,
+                                 "budget_enforced": self.config.budget_enforced, "total_cost_usd": None,
+                                 "duration_seconds": time.monotonic() - started})
+            raise
+        finally:
+            if code is not None and self._scaffold() != self.ADVISORY_SCAFFOLD:
+                cost = _completed_job_cost(self.config.jobs_root / name / "result.json")
+                store.write_summary({"status": "completed" if code == 0 else "runner_error", "return_code": code,
+                                     "budget_enforced": self.config.budget_enforced, "total_cost_usd": cost,
+                                     "duration_seconds": time.monotonic() - started})
+
+    def _dispatch(self, spec: TrialSpec, prepared_task_dir: Path, environment: dict[str, str], store: RunStore) -> int:
         if self._scaffold() == self.ADVISORY_SCAFFOLD:
-            return self._run_poc(spec, prepared_task_dir, environment)
+            return self._run_poc(spec, prepared_task_dir, environment, store)
         if self._scaffold() != self.MINI_SWE_AGENT:
-            completed = subprocess.run(
+            completed = run_command(
                 self.command(spec, task_dir=prepared_task_dir),
                 cwd=self.config.project_root,
                 env=environment,
@@ -239,7 +279,7 @@ class HarborTrialRunner:
             max_cost_usd=profile.run_max_cost_usd,
         )
         try:
-            completed = subprocess.run(
+            completed = run_command(
                 self.command(spec, task_dir=prepared_task_dir),
                 cwd=self.config.project_root,
                 env=environment,
@@ -291,21 +331,18 @@ class HarborTrialRunner:
         if not manifest:
             raise RunnerConfigError("the SWE POC requires a frozen task_manifest")
         try:
-            sample = json.loads(_under_root(self.config.project_root, manifest).read_text())
-            task_ids = {task["task_id"] for task in sample["tasks"]}
+            from .trial_pool import select_tasks
+            task_ids = set(select_tasks(None, _under_root(self.config.project_root, manifest)))
         except (OSError, KeyError, TypeError, ValueError) as error:
             raise RunnerConfigError(f"cannot read frozen task manifest: {error}") from error
         if spec.task_id not in task_ids:
             raise RunnerConfigError(f"task {spec.task_id!r} is outside the frozen POC sample")
 
-    def _run_poc(self, spec: TrialSpec, task_dir: Path, environment: dict[str, str]) -> int:
+    def _run_poc(self, spec: TrialSpec, task_dir: Path, environment: dict[str, str], store: RunStore) -> int:
         """Record the run without reserving, settling, or enforcing dollar caps."""
         job_name = self._job_name(spec)
         # Kept outside Harbor's job directory so Harbor can create that directory.
-        secrets = tuple(value for key, value in environment.items()
-                        if any(word in key.upper() for word in ("API_KEY", "TOKEN", "PASSWORD", "OPENROUTER_KEY")))
-        store = RunStore(self.config.jobs_root / "_poc_records" / job_name, secrets=secrets)
-        store.write_metadata({
+        store.write_metadata({**json.loads((store.run_dir / "metadata.json").read_text()),
             "task_id": spec.task_id, "profile": spec.profile,
             "consultation": self.config.consultation, "budget_enforced": False,
             "actor_max_steps": int(self.config.agent["max_steps"]),
@@ -321,7 +358,7 @@ class HarborTrialRunner:
         store.append_event("dispatch", {"actor_call": 0, "job_name": job_name})
         try:
             with (store.run_dir / "harbor-console.log").open("w") as console:
-                completed = subprocess.run(
+                completed = run_command(
                     self.command(spec, task_dir=task_dir), cwd=self.config.project_root,
                     env=environment, check=False, stdout=console, stderr=subprocess.STDOUT,
                 )
@@ -359,7 +396,7 @@ class HarborTrialRunner:
         })
         return completed.returncode
 
-    def _prepare_task(self, spec: TrialSpec, source: Path) -> Path:
+    def _prepare_task(self, spec: TrialSpec, source: Path, *, expected_sha256: str | None = None) -> Path:
         """Stage a task with the scaffold's least-privilege agent network policy."""
         destination = (
             self.config.jobs_root
@@ -367,9 +404,11 @@ class HarborTrialRunner:
             / self._job_name(spec)
         )
         if destination.exists():
-            shutil.rmtree(destination)
+            raise RunnerConfigError("prepared attempt already exists; use a new attempt")
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source, destination)
+        if expected_sha256 and package_hash(destination) != expected_sha256:
+            raise RunnerConfigError("task package changed during staging; no inference was dispatched")
         manifest = destination / "task.toml"
         if not manifest.is_file():
             raise RunnerConfigError(f"task manifest does not exist: {manifest}")
@@ -500,14 +539,79 @@ class HarborTrialRunner:
         return args
 
     def _harbor_prefix(self) -> list[str]:
-        wrapper = str(self.config.project_root / "scripts/with_anonymous_docker.sh")
+        prefix = [sys.executable, "-m", "autoresearch_budget.docker_runtime"]
         explicit = os.environ.get("HARBOR_BIN")
         if explicit:
-            return [wrapper, explicit]
-        installed = shutil.which("harbor")
-        if installed:
-            return [wrapper, installed]
-        return [wrapper, "uvx", "harbor==0.23.0"]
+            return [*prefix, explicit]
+        # Invoke Harbor in this interpreter, where the harness is installed.
+        return [*prefix, sys.executable, "-m", "harbor.cli.main"]
+
+
+
+def _directory_name(value) -> bool:
+    return (isinstance(value, str) and bool(value.strip()) and value == value.strip()
+            and value not in {".", ".."} and "/" not in value and "\\" not in value
+            and not any(ord(char) < 32 for char in value))
+
+
+def _validate_config(raw) -> None:
+    if not isinstance(raw, dict):
+        raise RunnerConfigError("configuration must be a JSON object")
+    for name in ("budget", "agent", "profiles"):
+        if not isinstance(raw.get(name), dict) or not raw[name]:
+            raise RunnerConfigError(f"{name} must be a nonempty object")
+    for name in ("locations", "consultation"):
+        if name in raw and not isinstance(raw[name], dict):
+            raise RunnerConfigError(f"{name} must be an object")
+    budget, agent = raw["budget"], raw["agent"]
+    for name, value in (("paid_inference_enabled", raw.get("paid_inference_enabled", False)),
+                        ("budget.enforce", budget.get("enforce", True))):
+        if type(value) is not bool:
+            raise RunnerConfigError(f"{name} must be a JSON boolean")
+    enforced = budget.get("enforce", True)
+    def money(name, value):
+        try:
+            amount = Decimal(str(value))
+        except (ValueError, InvalidOperation):
+            raise RunnerConfigError(f"{name} must be a finite nonnegative amount") from None
+        if not amount.is_finite() or amount < 0:
+            raise RunnerConfigError(f"{name} must be a finite nonnegative amount")
+    if enforced and "cap_usd" not in budget:
+        raise RunnerConfigError("budget.cap_usd is required for enforced accounting")
+    money("budget.cap_usd", budget.get("cap_usd", 0))
+    for name, value in [("budget.ledger", budget.get("ledger")),
+                        *[("locations." + key, value) for key, value in raw.get("locations", {}).items()],
+                        *([( "workspace", raw["workspace"])] if "workspace" in raw else [])]:
+        if not isinstance(value, str) or not value.strip():
+            raise RunnerConfigError(f"{name} must be a nonempty path string")
+    for name in ("max_steps", "max_tokens_per_call", "command_timeout_sec", "max_observation_chars"):
+        value = agent.get(name)
+        if type(value) is not int or value < (100 if name == "max_observation_chars" else 1):
+            raise RunnerConfigError(f"agent.{name} must be a positive integer" + (" of at least 100" if name == "max_observation_chars" else ""))
+    if agent.get("scaffold", "budget-shell") not in HarborTrialRunner.SUPPORTED_SCAFFOLDS:
+        raise RunnerConfigError("unsupported agent scaffold")
+    if agent.get("scaffold") in {"mini-swe-agent", "mini-swe-advisor"} and str(agent.get("version")) != "2.4.6":
+        raise RunnerConfigError("mini-SWE execution requires version 2.4.6")
+    for name, profile in raw["profiles"].items():
+        if not _directory_name(name) or not isinstance(profile, dict):
+            raise RunnerConfigError("profiles need plain names and object values")
+        if not isinstance(profile.get("model"), str) or not profile["model"].strip():
+            raise RunnerConfigError(f"profiles.{name}.model must be a nonempty string")
+        if enforced and "run_max_cost_usd" not in profile:
+            raise RunnerConfigError(f"profiles.{name}.run_max_cost_usd is required")
+        money(f"profiles.{name}.run_max_cost_usd", profile.get("run_max_cost_usd", 0))
+        for key in ("provider", "fallback"):
+            if profile.get(key) is not None and not isinstance(profile[key], dict):
+                raise RunnerConfigError(f"profiles.{name}.{key} must be an object")
+    if not enforced and agent.get("scaffold") != "mini-swe-advisor":
+        raise RunnerConfigError("budget.enforce=false requires mini-swe-advisor")
+    if agent.get("scaffold") == "mini-swe-advisor":
+        if enforced:
+            raise RunnerConfigError("advisory execution requires budget.enforce=false")
+        try:
+            AdvicePolicy.load(raw.get("consultation", {}))
+        except (TypeError, ValueError) as error:
+            raise RunnerConfigError(str(error)) from error
 
 
 def _under_root(root: Path, value: str | Path) -> Path:

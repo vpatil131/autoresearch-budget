@@ -18,6 +18,9 @@ def select_tasks(task_ids: list[str] | None, manifest: Path | None) -> list[str]
         task_ids = [task["task_id"] for task in data["tasks"]]
     if not task_ids or any(not isinstance(task, str) or not task.strip() for task in task_ids):
         raise RunnerConfigError("select at least one nonempty task ID")
+    if any("/" in task or "\\" in task or task in {".", ".."} or task != task.strip()
+           or any(ord(char) < 32 for char in task) for task in task_ids):
+        raise RunnerConfigError("task IDs must be plain directory names")
     if len(set(task_ids)) != len(task_ids):
         raise RunnerConfigError("task IDs must be distinct")
     return task_ids
@@ -36,7 +39,11 @@ class TrialPool:
         self.commands = [runner.command(spec) for spec in specs]
 
     def plan(self) -> dict:
-        return {"workers": self.workers, "effective_workers": min(self.workers, len(self.specs)),
+        config = self.runner.config
+        return {"budget_enforced": config.budget_enforced,
+                "accounting_mode": "reserved" if config.budget_enforced else "observational; dollars are not capped",
+                "paid_inference_enabled": config.paid_inference_enabled,
+                "workers": self.workers, "effective_workers": min(self.workers, len(self.specs)),
                 "trials": [{"task_id": spec.task_id, "profile": spec.profile,
                             "attempt": spec.attempt, "command": command}
                            for spec, command in zip(self.specs, self.commands)]}
@@ -50,7 +57,7 @@ class TrialPool:
             if not all((directory / filename).is_file() for filename in ("task.toml", "instruction.md")):
                 raise RunnerConfigError(f"task package is incomplete: {spec.task_id}")
             job = self.runner._job_name(spec)
-            if (config.jobs_root / job).exists() or (config.jobs_root / "_poc_records" / job).exists():
+            if (config.jobs_root / job).exists() or (config.jobs_root / "_poc_records" / job).exists() or (config.jobs_root / "_run_records" / job).exists():
                 raise RunnerConfigError(f"trial attempt already exists: {job}; use a new attempt or jobs directory")
 
         # Initialize a new shared ledger once before concurrent reservations.
@@ -81,7 +88,7 @@ class TrialPool:
                         code = future.result()
                         error = None
                     except Exception as exception:
-                        code, error = 1, f"{type(exception).__name__}: {exception}"
+                        code, error = 1, type(exception).__name__
                     completed += 1
                     failed = failed or code != 0
                     if report:

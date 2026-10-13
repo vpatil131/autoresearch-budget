@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from dataclasses import replace
 import fcntl
 import hashlib
 import json
@@ -15,6 +16,7 @@ from typing import Callable
 from .runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, TrialSpec, _read_env_file
 from .store import RunStore
 from .advisor import AdvicePolicy
+from .provenance import package_hash, runtime_identity
 
 VALID_STOPS = {"Submitted", "LimitsExceeded", "TimeExceeded", "RepeatedFormatError"}
 MAX_CONCURRENCY = 6
@@ -77,17 +79,19 @@ class BatchRunner:
         self.policy = AdvicePolicy.load(config.consultation)
         manifest = config.project_root / config.consultation["task_manifest"]
         self.manifest = read_json(manifest)
-        self.tasks = [t["task_id"] for t in self.manifest["tasks"]]
+        from .trial_pool import select_tasks
+        self.tasks = select_tasks(None, manifest)
         if not self.tasks or len(set(self.tasks)) != len(self.tasks):
             raise RunnerConfigError("task manifest must contain distinct tasks")
         self.raw_config = config.resolved_config()
-        self.fingerprint = hashlib.sha256(json.dumps({"config": self.raw_config, "manifest": self.manifest,
-                                                     "profile": profile}, sort_keys=True).encode()).hexdigest()
         for task in self.tasks:
             self.runner.command(TrialSpec(task, profile))
             directory = config.task_root / task
             if not all((directory / filename).is_file() for filename in ("task.toml", "instruction.md")):
                 raise RunnerConfigError(f"task package is incomplete: {task}")
+        self.task_hashes = {task: package_hash(config.task_root / task) for task in self.tasks}
+        self.fingerprint = hashlib.sha256(json.dumps({"config": self.raw_config, "manifest": self.manifest,
+            "profile": profile, "task_packages": self.task_hashes, "runtime": runtime_identity()}, sort_keys=True).encode()).hexdigest()
 
     def paths(self, job: str) -> dict:
         return {"job_dir": str(self.config.jobs_root / job),
@@ -112,7 +116,7 @@ class BatchRunner:
     def plan(self) -> dict:
         metadata = read_json(self.batch / "metadata.json", {})
         if metadata.get("fingerprint") and metadata["fingerprint"] != self.fingerprint:
-            raise RunnerConfigError("batch configuration, profile or task manifest changed; use a new batch directory")
+            raise RunnerConfigError("batch configuration, task contents or runtime changed; use a new batch directory")
         if metadata and not metadata.get("fingerprint"):
             # Accept a legacy sequential batch only with its exact frozen settings.
             if (read_json(self.batch / "config.json") != self.raw_config
@@ -169,6 +173,8 @@ class BatchRunner:
                 "every_steps": self.policy.every_steps if self.policy.policy == "fixed_interval" else None,
                 "actor_max_steps": self.config.agent["max_steps"],
                 "paid_inference_enabled": self.config.paid_inference_enabled,
+                "budget_enforced": self.config.budget_enforced,
+                "accounting_mode": "observational; dollar spending is not capped",
                 "models": {role: {"model": self.config.profiles[name].model,
                                   "provider": self.config.profiles[name].provider,
                                   "service_tier": self.config.profiles[name].service_tier,
@@ -185,6 +191,9 @@ class BatchRunner:
         spec = TrialSpec(claim["task_id"], self.profile, claim["attempt"])
         try:
             frozen = ExperimentConfig.load(self.batch / "config.json", project_root=self.config.project_root)
+            if package_hash(self.config.task_root / claim["task_id"]) != self.task_hashes[claim["task_id"]]:
+                raise RunnerConfigError("task contents changed before dispatch")
+            frozen = replace(frozen, consultation={**frozen.consultation, "task_manifest": str(self.batch / "manifest.json")})
             code = HarborTrialRunner(frozen).run(spec, env_file=self.env_file, source_root=source)
             return self._collect(claim, code)
         except Exception as error:
@@ -202,7 +211,7 @@ class BatchRunner:
         package = source / "autoresearch_budget"
         package.mkdir(parents=True)
         hashes = {}
-        for path in (self.config.project_root / "src/autoresearch_budget").glob("*.py"):
+        for path in Path(__file__).resolve().parent.glob("*.py"):
             content = path.read_bytes()
             (package / path.name).write_bytes(content)
             hashes[path.name] = hashlib.sha256(content).hexdigest()
@@ -242,7 +251,8 @@ class BatchRunner:
             if not metadata_path.exists():
                 store.write_metadata({"started_at": now(), "fingerprint": self.fingerprint,
                                       "config": self.raw_config, "tasks": self.tasks,
-                                      "profile": self.profile, "execution": "parallel"})
+                                      "profile": self.profile, "execution": "parallel",
+                                      "jobs_root_relative": os.path.relpath(self.config.jobs_root, self.batch)})
                 RunStore._write_json_atomic(self.batch / "config.json", self.raw_config)
                 RunStore._write_json_atomic(self.batch / "manifest.json", self.manifest)
             records = store.redact(plan["records"])

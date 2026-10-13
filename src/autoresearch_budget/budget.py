@@ -281,3 +281,25 @@ class BudgetLedger:
             except Exception:
                 connection.rollback()
                 raise
+
+
+def inspect_ledger(path: str | Path) -> dict:
+    """Read an existing ledger without creating it or changing its journal mode."""
+    uri = Path(path).expanduser().resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        budget = connection.execute("SELECT cap_microusd FROM budget WHERE singleton=1").fetchone()
+        if budget is None:
+            raise BudgetError("ledger has no configured cap")
+        reservations = []
+        for row in connection.execute("SELECT * FROM reservations ORDER BY created_at, reservation_id"):
+            record = dict(row)
+            for key in ("reserved_microusd", "actual_microusd"):
+                value = record.pop(key)
+                record[key.replace("microusd", "usd")] = str(from_microusd(value)) if value is not None else None
+            reservations.append(record)
+        settled = sum((Decimal(r["actual_usd"]) for r in reservations if r["status"] == "settled"), Decimal(0))
+        held = sum((Decimal(r["reserved_usd"]) for r in reservations if r["status"] in {"active", "uncertain"}), Decimal(0))
+        cap = from_microusd(budget["cap_microusd"])
+        return {"snapshot": {"cap_usd": str(cap), "settled_usd": str(settled), "held_usd": str(held),
+                             "available_usd": str(max(Decimal(0), cap-settled-held))}, "reservations": reservations}

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from autoresearch_budget.batch import BatchRunner, append, coordinator_lock, read_lines
 from autoresearch_budget.cli import main
-from autoresearch_budget.runner import ExperimentConfig, RunnerConfigError, TrialSpec
+from autoresearch_budget.runner import ExperimentConfig, HarborTrialRunner, RunnerConfigError, TrialSpec
 
 
 class BatchTest(unittest.TestCase):
@@ -94,7 +94,7 @@ class BatchTest(unittest.TestCase):
                 kwargs['stdout'].write(job + ' offline-secret\n')
                 with mutex:running -= 1
                 return type('Result', (), {'returncode': 0})()
-            with patch('subprocess.run', side_effect=harbor):
+            with patch('autoresearch_budget.runner.run_command', side_effect=harbor):
                 self.assertEqual(runner.run(), 0)
             self.assertEqual(peak, 6)
             self.assertEqual(len(set(seen)), 12)
@@ -308,6 +308,35 @@ class BatchTest(unittest.TestCase):
             records = read_lines(runner.batch/'attempts.jsonl')
             self.assertEqual(records[0]['error'], 'ValueError')
             self.assertNotIn('offline-secret', (runner.batch/'status.json').read_text())
+
+    def test_resume_rejects_changed_task_contents_or_runtime(self):
+        with TemporaryDirectory() as temporary:
+            root=Path(temporary);config=self.config(root,count=1);runner=self.batch(config)
+            runner.execute=lambda claim,source:self.outcome(claim)
+            self.assertEqual(runner.run(),0)
+            instruction=config.task_root/runner.tasks[0]/'instruction.md'
+            original=instruction.read_text();instruction.write_text('Changed issue')
+            with self.assertRaisesRegex(RunnerConfigError,'task contents or runtime changed'):
+                self.batch(config).plan()
+            instruction.write_text(original)
+            with patch('autoresearch_budget.batch.runtime_identity',return_value={'source_sha256':{'changed.py':'hash'}}):
+                with self.assertRaisesRegex(RunnerConfigError,'task contents or runtime changed'):
+                    self.batch(config).plan()
+
+    def test_worker_uses_the_frozen_manifest_instead_of_mutable_workspace_copy(self):
+        with TemporaryDirectory() as temporary:
+            root=Path(temporary);config=self.config(root,count=1);runner=self.batch(config)
+            runner.batch.mkdir(parents=True)
+            (runner.batch/'config.json').write_text(json.dumps(config.resolved_config()))
+            (runner.batch/'manifest.json').write_text(json.dumps(runner.manifest))
+            (root/'sample.json').write_text('{"tasks":[]}')
+            def execute(instance,spec,**kwargs):
+                self.assertEqual(instance.config.consultation['task_manifest'],str(runner.batch/'manifest.json'))
+                self.assertEqual(instance.config.consultation['policy'],'fixed_interval')
+                return 0
+            with patch.object(HarborTrialRunner,'run',autospec=True,side_effect=execute):
+                result=runner._execute(runner._claim(runner.tasks[0],1),root/'source')
+            self.assertEqual(result['return_code'],0)
 
 
 if __name__ == '__main__':unittest.main()

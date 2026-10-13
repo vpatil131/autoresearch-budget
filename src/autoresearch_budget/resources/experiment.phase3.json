@@ -1,0 +1,71 @@
+{
+  "budget": {
+    "ledger": "runs/budget.sqlite3",
+    "cap_usd": "15.00",
+    "enforce": false
+  },
+  "locations": {
+    "task_root": "data/harbor/swe-rebench-07-2026",
+    "jobs_root": "runs/phase3-trials"
+  },
+  "agent": {
+    "scaffold": "mini-swe-advisor",
+    "version": "2.4.6",
+    "max_steps": 80,
+    "max_tokens_per_call": 4096,
+    "command_timeout_sec": 600,
+    "max_observation_chars": 20000
+  },
+  "profiles": {
+    "small": {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "run_max_cost_usd": "0.75",
+      "provider": {
+        "only": [
+          "DeepInfra"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      }
+    },
+    "frontier": {
+      "model": "openai/gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "service_tier": "flex",
+      "run_max_cost_usd": "2.00",
+      "provider": {
+        "only": [
+          "OpenAI"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      },
+      "fallback": {
+        "provider": {
+          "only": [
+            "azure"
+          ],
+          "allow_fallbacks": false,
+          "require_parameters": true
+        },
+        "max_tokens_parameter": "max_completion_tokens"
+      }
+    }
+  },
+  "paid_inference_enabled": false,
+  "consultation": {
+    "policy": "hybrid",
+    "max_calls": 7,
+    "max_automatic_recovery_calls": 1,
+    "max_context_chars": 60000,
+    "max_output_tokens": 4096,
+    "advisor_profile": "frontier",
+    "task_manifest": "config/sample-24-v2.json",
+    "stall_steps": 8,
+    "inspection_steps": 8,
+    "failure_threshold": 3,
+    "uncertainty_steps": 3,
+    "contradiction_steps": 2,
+    "min_actor_calls_remaining": 4
+  }
+}

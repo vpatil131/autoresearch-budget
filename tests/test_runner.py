@@ -42,6 +42,8 @@ class HarborTrialRunnerTest(unittest.TestCase):
             },
             "paid_inference_enabled": paid,
         }
+        if scaffold == "mini-swe-advisor":
+            value["budget"]["enforce"] = False
         path = root / "experiment.json"
         path.write_text(json.dumps(value))
         return ExperimentConfig.load(path, project_root=root)
@@ -112,7 +114,7 @@ class HarborTrialRunnerTest(unittest.TestCase):
             (root / ".env").write_text("OPENROUTER_API_KEY=test-key\n")
             runner = HarborTrialRunner(self._config(root, paid=True))
             completed = Mock(returncode=0)
-            with patch("subprocess.run", return_value=completed) as run:
+            with patch("autoresearch_budget.runner.run_command", return_value=completed) as run:
                 self.assertEqual(
                     runner.run(TrialSpec("owner__repo-1", "small")), 0
                 )
@@ -167,7 +169,7 @@ class HarborTrialRunnerTest(unittest.TestCase):
                 )
                 return Mock(returncode=0)
 
-            with patch("subprocess.run", side_effect=completed_run):
+            with patch("autoresearch_budget.runner.run_command", side_effect=completed_run):
                 self.assertEqual(runner.run(TrialSpec("owner__repo-1", "small")), 0)
             snapshot = BudgetLedger(config.budget_db, config.budget_cap_usd).snapshot()
             self.assertEqual(str(snapshot.settled_usd), "0.120000")
@@ -265,7 +267,7 @@ class HarborTrialRunnerTest(unittest.TestCase):
                 (agent.parent/'result.json').write_text(json.dumps({'verifier_result':{'rewards':{'reward':1.0}}}))
                 (config.jobs_root/job/'result.json').write_text(json.dumps({'finished_at':'now'}))
                 return Mock(returncode=0)
-            with patch('subprocess.run',side_effect=completed), patch('autoresearch_budget.runner.BudgetLedger',side_effect=AssertionError('No dollar enforcement')):
+            with patch('autoresearch_budget.runner.run_command',side_effect=completed), patch('autoresearch_budget.runner.BudgetLedger',side_effect=AssertionError('No dollar enforcement')):
                 self.assertEqual(runner.run(spec),0)
             records=config.jobs_root/'_poc_records'/job
             metadata=json.loads((records/'metadata.json').read_text())
@@ -276,7 +278,7 @@ class HarborTrialRunnerTest(unittest.TestCase):
             events=[json.loads(line) for line in (records/'events.jsonl').read_text().splitlines()]
             self.assertTrue(any(e['kind']=='post_submission_verifier' and e['payload']['track']=='post_submission' for e in events))
             self.assertEqual(json.loads((records/'summary.json').read_text())['status'],'completed')
-            with patch('subprocess.run',side_effect=AssertionError('Must preserve first run')):
+            with patch('autoresearch_budget.runner.run_command',side_effect=AssertionError('Must preserve first run')):
                 with self.assertRaises(RunnerConfigError):
                     runner.run(spec)
             self.assertNotEqual(runner._job_name(spec),runner._job_name(TrialSpec("owner__repo-1","small",2)))
@@ -284,7 +286,7 @@ class HarborTrialRunnerTest(unittest.TestCase):
             # verify metadata records the override rather than rereading phase 1.
             config=config.with_consultation_overrides(policy='advice_requested',max_calls=2)
             runner=HarborTrialRunner(config); job=runner._job_name(spec)
-            with patch('subprocess.run',side_effect=completed):
+            with patch('autoresearch_budget.runner.run_command',side_effect=completed):
                 self.assertEqual(runner.run(spec),0)
             metadata=json.loads((config.jobs_root/'_poc_records'/job/'metadata.json').read_text())
             self.assertEqual(metadata['configuration']['consultation']['max_calls'],2)

@@ -19,3 +19,6 @@ config/*.local.json
 /research/
 /LLMDay-Austin-Oct10/
 /docs/publication_plan.md
+dist/
+build/
+*.egg-info/

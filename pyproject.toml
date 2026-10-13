@@ -1,13 +1,21 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
 name = "autoresearch-budget"
 version = "0.1.0"
-description = "Budget-controlled SWE-rebench experiment runner"
-requires-python = ">=3.11"
+description = "Research harness for bounded advice in coding-agent experiments"
+readme = "README.md"
+classifiers = ["Development Status :: 3 - Alpha", "Programming Language :: Python :: 3", "Operating System :: POSIX"]
+requires-python = ">=3.12"
 dependencies = []
+
+[project.optional-dependencies]
+runtime = ["harbor==0.23.0", "mini-swe-agent==2.4.6"]
+
+[dependency-groups]
+dev = ["build==1.3.0"]
 
 [project.scripts]
 autoresearch-budget = "autoresearch_budget.cli:main"
@@ -15,3 +23,7 @@ autoresearch-budget = "autoresearch_budget.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/autoresearch_budget"]
 
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/docs/publication_plan.md", "**/*.local.json", "**/__pycache__", "**/*.pyc"]
+include = ["/src", "/tests", "/config", "/scripts", "/docs/architecture.md", "/docs/usage.md", "/docs/configuration.md", "/README.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/SECURITY.md", "/LICENSE", "/pyproject.toml", "/uv.lock"]
