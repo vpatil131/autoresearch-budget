@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-10-12
 
 Experimental researcher workflow for SWE-rebench coding tasks through Harbor.
 
@@ -10,4 +10,6 @@ Experimental researcher workflow for SWE-rebench coding tasks through Harbor.
 - Local text/JSON/CSV reports and descriptive matched comparisons with unknown costs and incomplete records retained explicitly.
 - Configuration, extension, contribution and recovery documentation, plus offline CI and wheel verification.
 
-Advisory dollar enforcement, a hosted dataset downloader, arbitrary local-repository execution, additional inference gateways and a stable public SDK remain outside this release's supported interface. Live provider/container compatibility and a public tagged release require separate release verification.
+Standalone and advisory integration checks cover live provider routing, container execution, independent grading, and reporting. These checks establish integration behavior, not benchmark performance.
+
+Advisory dollar enforcement, a hosted dataset downloader, arbitrary local-repository execution, additional inference gateways and a stable public SDK remain outside this release's supported interface.

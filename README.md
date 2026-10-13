@@ -1,5 +1,7 @@
 # Autoresearch on a budget
 
+[![Offline verification](https://github.com/vpatil131/autoresearch-budget/actions/workflows/ci.yml/badge.svg)](https://github.com/vpatil131/autoresearch-budget/actions/workflows/ci.yml)
+
 An experimental research harness for studying how a small coding actor uses bounded guidance from a frontier advisor. Researchers can run matched standalone, advisory, and control conditions, inspect advice follow-through, and compare independently graded outcomes.
 
 **SWE-rebench through Harbor is the initially supported benchmark.** Other compatible Harbor software engineering task packages are experimental. Direct execution on an arbitrary local repository and a general agent SDK are later capabilities.
@@ -10,12 +12,27 @@ The repository contains code, tests, documentation, disabled presets, and clean 
 
 ## Install and see advice working
 
-Use Python 3.12 or newer on macOS or Linux. From a source checkout:
+Use Python 3.12 or newer on macOS or Linux. Install the versioned wheel from the [GitHub release](https://github.com/vpatil131/autoresearch-budget/releases/tag/v0.1.0):
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
+python -m pip install 'autoresearch-budget[runtime] @ https://github.com/vpatil131/autoresearch-budget/releases/download/v0.1.0/autoresearch_budget-0.1.0-py3-none-any.whl'
+```
+
+Alternatively, clone the repository and install from source:
+
+```sh
+git clone https://github.com/vpatil131/autoresearch-budget.git
+cd autoresearch-budget
+python3 -m venv .venv
+. .venv/bin/activate
 python -m pip install '.[runtime]'
+```
+
+Then create an experiment workspace and run the offline demonstration:
+
+```sh
 autoresearch-budget init --workspace ./experiment --preset hybrid
 cd experiment
 autoresearch-budget doctor --offline --config experiment.local.json
@@ -127,7 +144,7 @@ If you use this harness in research, cite the software and include its repositor
 
 Machine-readable software metadata is available in [CITATION.cff](CITATION.cff), also used by GitHub's “Cite this repository” feature.
 
-The current package version is `0.1.0` and is in preparation for its first release. Record the task cohort, dataset revision, configuration, and runtime provenance alongside the software citation so others can repeat the setup.
+The first experimental release is `0.1.0`. Record the task cohort, dataset revision, configuration, and runtime provenance alongside the software citation so others can repeat the setup.
 
 This harness builds on the following projects:
 
