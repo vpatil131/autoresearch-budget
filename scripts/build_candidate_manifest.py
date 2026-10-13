@@ -88,7 +88,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("research/july_2026_manifest.json"),
+        default=Path("data/manifests/july_2026_manifest.json"),
     )
     args = parser.parse_args()
 

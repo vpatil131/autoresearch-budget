@@ -1,6 +1,6 @@
 {
-  "name": "swe-rebench-historical-task-identities",
-  "description": "Historical task identities; experiment measurements are archived separately.",
+  "name": "swe-rebench-development-24",
+  "description": "Frozen task identities for development and reproducible task selection. This selected cohort is not a representative benchmark sample.",
   "source": {
     "harbor_dataset": "ibragim-badertdinov/swe-rebench-07-2026",
     "version": "1.0.0",
