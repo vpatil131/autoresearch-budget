@@ -19,6 +19,8 @@ config/*.local.json
 /research/
 /LLMDay-Austin-Oct10/
 /docs/publication_plan.md
+/docs/*speaker-notes*.md
+/experiment/
 dist/
 build/
 *.egg-info/

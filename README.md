@@ -4,6 +4,8 @@ An experimental research harness for studying how a small coding actor uses boun
 
 **SWE-rebench through Harbor is the initially supported benchmark.** Other compatible Harbor software engineering task packages are experimental. Direct execution on an arbitrary local repository and a general agent SDK are later capabilities.
 
+The supported paid workflow uses **OpenRouter** for actor and advisor inference. Model profiles select models and underlying providers through that gateway. Direct provider APIs and local inference endpoints require implementation work; offline inspection, planning, reporting, and the scripted demo need no gateway credentials.
+
 The repository contains code, tests, documentation, disabled presets, and clean task identities. Downloaded datasets, experiment results, trajectories, ledgers, and presentations belong outside tracked source.
 
 ## Install and see advice working
@@ -121,7 +123,9 @@ Reproducing an experiment setup does not guarantee identical model outputs or sc
 
 If you use this harness in research, cite the software and include its repository URL and the released version or exact Git commit used:
 
-> Patil, Vashishtha (2026). *Autoresearch on a budget* [Software].
+> Patil, Vashishtha (2026). *Autoresearch on a budget* [Software]. https://github.com/vpatil131/autoresearch-budget
+
+Machine-readable software metadata is available in [CITATION.cff](CITATION.cff), also used by GitHub's “Cite this repository” feature.
 
 The current package version is `0.1.0` and is in preparation for its first release. Record the task cohort, dataset revision, configuration, and runtime provenance alongside the software citation so others can repeat the setup.
 

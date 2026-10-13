@@ -13,6 +13,11 @@ classifiers = ["Development Status :: 3 - Alpha", "Programming Language :: Pytho
 requires-python = ">=3.12"
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/vpatil131/autoresearch-budget"
+Documentation = "https://github.com/vpatil131/autoresearch-budget/blob/main/README.md"
+Issues = "https://github.com/vpatil131/autoresearch-budget/issues"
+
 [project.optional-dependencies]
 runtime = ["harbor==0.23.0", "mini-swe-agent==2.4.6"]
 
@@ -28,4 +33,4 @@ packages = ["src/autoresearch_budget"]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/docs/publication_plan.md", "**/*.local.json", "**/__pycache__", "**/*.pyc"]
-include = ["/src", "/tests", "/config", "/scripts", "/docs/architecture.md", "/docs/usage.md", "/docs/configuration.md", "/README.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/SECURITY.md", "/LICENSE", "/pyproject.toml", "/uv.lock"]
+include = ["/src", "/tests", "/config", "/scripts", "/docs/architecture.md", "/docs/usage.md", "/docs/configuration.md", "/README.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/SECURITY.md", "/LICENSE", "/CITATION.cff", "/pyproject.toml", "/uv.lock"]

@@ -45,7 +45,7 @@ Edit a named profile, keeping the rest of the execution condition frozen. For ex
 }
 ```
 
-The names above are placeholders; substitute an available OpenRouter model/provider. `run_max_cost_usd` applies to standalone reservations and the mini-SWE cost limit. Omit it for advisory presets. Optional `reasoning_effort` and `service_tier` are sent to the configured route. A paid `probe` is an explicit compatibility check, never part of `doctor`; use an enforced standalone config and an explicit `--max-cost-usd`.
+The names above are placeholders; substitute an available OpenRouter model/provider. All supported paid CLI paths use OpenRouter; `provider.only` selects an upstream provider through that gateway. Direct OpenAI, Anthropic, DeepInfra, and local model endpoints require additional adapters, credential handling, network policy, and accounting integration. Changing a model string alone does not add another gateway. `run_max_cost_usd` applies to standalone reservations and the mini-SWE cost limit. Omit it for advisory presets. Optional `reasoning_effort` and `service_tier` are sent to the configured route. A paid `probe` is an explicit compatibility check, never part of `doctor`; use an enforced standalone config and an explicit `--max-cost-usd`.
 
 Advisor fallback may only change provider, service tier, and `max_tokens_parameter`. Both routes must explicitly select providers with `allow_fallbacks=false`; the fallback cannot request Flex processing. Retry/fallback physical requests remain distinct from logical consultation limits.
 
