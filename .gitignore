@@ -18,3 +18,4 @@ config/*.local.json
 /analysis/
 /research/
 /LLMDay-Austin-Oct10/
+/docs/publication_plan.md
